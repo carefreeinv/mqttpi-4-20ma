@@ -1,0 +1,23 @@
+# Local configuration (never commit)
+secrets.yaml
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# KiCad backups / caches
+*-backups/
+*.kicad_prl
+fp-info-cache
+_autosave-*
+*.lck

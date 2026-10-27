@@ -1,0 +1,178 @@
+{
+  "homeassistant/sensor/gas-01_gas_h2s/config": {
+    "availability": [
+      {
+        "topic": "mqttpi/gas-01/status"
+      },
+      {
+        "topic": "mqttpi/gas-01/sensors/gas_h2s/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "device": {
+      "identifiers": [
+        "gas-01"
+      ],
+      "manufacturer": "mqttpi",
+      "model": "pi4",
+      "name": "Gas Monitor"
+    },
+    "icon": "mdi:molecule",
+    "json_attributes_topic": "mqttpi/gas-01/sensors/gas_h2s/attributes",
+    "name": "H2S",
+    "payload_available": "online",
+    "payload_not_available": "offline",
+    "state_class": "measurement",
+    "state_topic": "mqttpi/gas-01/sensors/gas_h2s/state",
+    "suggested_display_precision": 1,
+    "unique_id": "gas-01_gas_h2s",
+    "unit_of_measurement": "ppm"
+  },
+  "homeassistant/sensor/gas-01_gas_h2s_current/config": {
+    "availability": [
+      {
+        "topic": "mqttpi/gas-01/status"
+      },
+      {
+        "topic": "mqttpi/gas-01/sensors/gas_h2s_current/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "device": {
+      "identifiers": [
+        "gas-01"
+      ],
+      "manufacturer": "mqttpi",
+      "model": "pi4",
+      "name": "Gas Monitor"
+    },
+    "device_class": "current",
+    "entity_category": "diagnostic",
+    "json_attributes_topic": "mqttpi/gas-01/sensors/gas_h2s_current/attributes",
+    "name": "H2S loop current",
+    "payload_available": "online",
+    "payload_not_available": "offline",
+    "state_class": "measurement",
+    "state_topic": "mqttpi/gas-01/sensors/gas_h2s_current/state",
+    "suggested_display_precision": 2,
+    "unique_id": "gas-01_gas_h2s_current",
+    "unit_of_measurement": "mA"
+  },
+  "homeassistant/sensor/gas-01_gas_h2s_loop_fault/config": {
+    "availability": [
+      {
+        "topic": "mqttpi/gas-01/status"
+      },
+      {
+        "topic": "mqttpi/gas-01/sensors/gas_h2s_loop_fault/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "device": {
+      "identifiers": [
+        "gas-01"
+      ],
+      "manufacturer": "mqttpi",
+      "model": "pi4",
+      "name": "Gas Monitor"
+    },
+    "entity_category": "diagnostic",
+    "icon": "mdi:alert-circle-outline",
+    "json_attributes_topic": "mqttpi/gas-01/sensors/gas_h2s_loop_fault/attributes",
+    "name": "H2S loop fault",
+    "payload_available": "online",
+    "payload_not_available": "offline",
+    "state_class": "measurement",
+    "state_topic": "mqttpi/gas-01/sensors/gas_h2s_loop_fault/state",
+    "suggested_display_precision": 0,
+    "unique_id": "gas-01_gas_h2s_loop_fault"
+  },
+  "homeassistant/sensor/gas-01_gas_lel/config": {
+    "availability": [
+      {
+        "topic": "mqttpi/gas-01/status"
+      },
+      {
+        "topic": "mqttpi/gas-01/sensors/gas_lel/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "device": {
+      "identifiers": [
+        "gas-01"
+      ],
+      "manufacturer": "mqttpi",
+      "model": "pi4",
+      "name": "Gas Monitor"
+    },
+    "icon": "mdi:fire-alert",
+    "json_attributes_topic": "mqttpi/gas-01/sensors/gas_lel/attributes",
+    "name": "Combustible Gas",
+    "payload_available": "online",
+    "payload_not_available": "offline",
+    "state_class": "measurement",
+    "state_topic": "mqttpi/gas-01/sensors/gas_lel/state",
+    "suggested_display_precision": 1,
+    "unique_id": "gas-01_gas_lel",
+    "unit_of_measurement": "%LEL"
+  },
+  "homeassistant/sensor/gas-01_gas_lel_current/config": {
+    "availability": [
+      {
+        "topic": "mqttpi/gas-01/status"
+      },
+      {
+        "topic": "mqttpi/gas-01/sensors/gas_lel_current/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "device": {
+      "identifiers": [
+        "gas-01"
+      ],
+      "manufacturer": "mqttpi",
+      "model": "pi4",
+      "name": "Gas Monitor"
+    },
+    "device_class": "current",
+    "entity_category": "diagnostic",
+    "json_attributes_topic": "mqttpi/gas-01/sensors/gas_lel_current/attributes",
+    "name": "Combustible Gas loop current",
+    "payload_available": "online",
+    "payload_not_available": "offline",
+    "state_class": "measurement",
+    "state_topic": "mqttpi/gas-01/sensors/gas_lel_current/state",
+    "suggested_display_precision": 2,
+    "unique_id": "gas-01_gas_lel_current",
+    "unit_of_measurement": "mA"
+  },
+  "homeassistant/sensor/gas-01_gas_lel_loop_fault/config": {
+    "availability": [
+      {
+        "topic": "mqttpi/gas-01/status"
+      },
+      {
+        "topic": "mqttpi/gas-01/sensors/gas_lel_loop_fault/availability"
+      }
+    ],
+    "availability_mode": "all",
+    "device": {
+      "identifiers": [
+        "gas-01"
+      ],
+      "manufacturer": "mqttpi",
+      "model": "pi4",
+      "name": "Gas Monitor"
+    },
+    "entity_category": "diagnostic",
+    "icon": "mdi:alert-circle-outline",
+    "json_attributes_topic": "mqttpi/gas-01/sensors/gas_lel_loop_fault/attributes",
+    "name": "Combustible Gas loop fault",
+    "payload_available": "online",
+    "payload_not_available": "offline",
+    "state_class": "measurement",
+    "state_topic": "mqttpi/gas-01/sensors/gas_lel_loop_fault/state",
+    "suggested_display_precision": 0,
+    "unique_id": "gas-01_gas_lel_loop_fault"
+  }
+}

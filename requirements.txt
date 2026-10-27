@@ -1,0 +1,3 @@
+# Keep in sync with pyproject.toml [project].dependencies
+mqttpi @ git+https://github.com/carefreeinv/mqttpi@feature/onewire-i2c-sensor-drivers
+smbus2>=0.4

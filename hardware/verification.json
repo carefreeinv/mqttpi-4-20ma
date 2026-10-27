@@ -1,0 +1,48 @@
+[
+  {
+    "schematic": "hardware/single-channel/ads1115-4-20ma-single.kicad_sch",
+    "kicad_cli": "9.0.2",
+    "netlist_check": "pass",
+    "erc": {
+      "errors": 0,
+      "warnings": 14,
+      "warning_types": [
+        "footprint_link_issues"
+      ],
+      "details": [
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Capacitor_SMD'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Connector_PinSocket_2.54mm'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Diode_SMD'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Fuse'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Package_SO'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Package_TO_SOT_SMD'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Resistor_SMD'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'TerminalBlock_Phoenix'."
+      ]
+    },
+    "verified": true
+  },
+  {
+    "schematic": "hardware/hat-4ch/ads1115-4-20ma-hat-4ch.kicad_sch",
+    "kicad_cli": "9.0.2",
+    "netlist_check": "pass",
+    "erc": {
+      "errors": 0,
+      "warnings": 39,
+      "warning_types": [
+        "footprint_link_issues"
+      ],
+      "details": [
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Capacitor_SMD'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Connector_PinSocket_2.54mm'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Diode_SMD'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Fuse'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Package_SO'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Package_TO_SOT_SMD'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'Resistor_SMD'.",
+        "warning: footprint_link_issues: The current configuration does not include the footprint library 'TerminalBlock_Phoenix'."
+      ]
+    },
+    "verified": true
+  }
+]

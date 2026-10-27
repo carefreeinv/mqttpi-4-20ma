@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mqttpi-4-20ma"
+description = "ADS1115 analog inputs and 4-20 mA current-loop sensors for mqttpi (Home Assistant over MQTT)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+dynamic = ["version"]
+# Keep in sync with requirements.txt.
+# The sensor framework (mqttpi.sensors, I2C bus helpers) is not on mqttpi's main
+# branch yet: it lives in the stacked PRs #12/#14. Pin to the PR #14 branch until
+# those merge, then switch to main or a release tag.
+dependencies = [
+    "mqttpi @ git+https://github.com/carefreeinv/mqttpi@feature/onewire-i2c-sensor-drivers",
+    "smbus2>=0.4",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Home Automation",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/carefreeinv/mqttpi-4-20ma"
+mqttpi = "https://github.com/carefreeinv/mqttpi"
+
+[project.scripts]
+mqttpi-4-20ma = "mqttpi_4_20ma.daemon:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "mqttpi_4_20ma.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["mqttpi_4_20ma*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+# Same minimal rule set as mqttpi: pyflakes and pycodestyle errors.
+select = ["E", "F"]
+
+[tool.coverage.run]
+source = ["mqttpi_4_20ma"]

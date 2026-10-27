@@ -1,0 +1,87 @@
+# 4-20 mA gas transmitters through an ADS1115 — HA sensor entities
+#
+#   cp examples/gas-detector-4-20ma.yaml config.yaml
+#   mqttpi-4-20ma -c config.yaml
+#
+# Two loop-powered (2-wire) gas transmitters on one ADS1115 at 0x48, each loop
+# read across a 150 ohm 0.1 % shunt (20 mA -> 3.000 V, inside the +/-4.096 V PGA
+# range and below VDD = 3.3 V). Wiring: docs/wiring-single-channel.md.
+#
+# MONITORING / TELEMETRY ONLY. This does not replace a certified gas-detection
+# controller, alarm relays, or the transmitter's own alarm outputs.
+
+device:
+  id: gas-01
+  board: pi4
+  ha:
+    name: "Gas Monitor"
+
+mqtt:
+  host: 192.168.1.50
+  port: 1883
+  tls: false
+  base_topic: mqttpi/gas-01
+  client_id: mqttpi-gas-01
+  homeassistant:
+    discovery: true
+    discovery_prefix: homeassistant
+  retain: true
+  qos: 1
+
+buses:
+  i2c: { enabled: true, controller: 1, sda: 2, scl: 3 }
+
+pins:
+  # Combustible gas, 0-100 %LEL over 4-20 mA (check the range configured on
+  # your transmitter; many ship as 0-100 %LEL, some are field-configurable).
+  - alias: gas_lel
+    direction: analog_input
+    source: ads1115
+    bus: 1
+    address: 0x48             # 0x48-0x4B (ADDR pin)
+    channel: 0                # A0-A3 single-ended (shunt top to AINx, bottom to GND)
+    gain: 1                   # +/-4.096 V full scale; with VDD = 3.3 V only 0-3.3 V is usable
+    data_rate: 128            # samples/s
+    shunt_ohms: 150           # extension: precision shunt value (ohms)
+    loop: 4-20mA              # extension: current-loop mode
+    fault:                    # extension: NAMUR NE43 failure limits (defaults shown)
+      low_ma: 3.6             # at or below: open loop / transmitter fault
+      high_ma: 21.0           # at or above: over-range fault
+    smoothing: { alpha: 0.5 } # extension: EMA on the loop current (1 = off)
+    oversample: 4             # extension: conversions averaged per poll
+    publish:
+      interval_ms: 2000
+    ha:
+      name: "Combustible Gas"
+      state_class: measurement
+      unit_of_measurement: "%LEL"
+      icon: mdi:fire-alert
+      precision: 1
+      scale:                  # linear map of loop current -> published value
+        min: 0.0              # value at in_min (4 mA)  = range_min
+        max: 100.0            # value at in_max (20 mA) = range_max
+        in_min: 4.0
+        in_max: 20.0
+
+  # Hydrogen sulfide, 0-100 ppm over 4-20 mA.
+  - alias: gas_h2s
+    direction: analog_input
+    source: ads1115
+    bus: 1
+    address: 0x48
+    channel: 1
+    gain: 1
+    data_rate: 128
+    shunt_ohms: 150
+    loop: 4-20mA
+    publish:
+      interval_ms: 2000
+    ha:
+      name: "H2S"
+      state_class: measurement
+      unit_of_measurement: "ppm"
+      icon: mdi:molecule
+      precision: 1
+      scale:
+        min: 0.0
+        max: 100.0

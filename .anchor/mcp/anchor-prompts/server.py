@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""anchor-prompts MCP server — gives any MCP-capable agent (Claude Code, Grok Build, local
+agents) the Anchor scaffolding as callable tools, so lesser models don't have to remember
+the discipline: they can fetch it.
+
+Run: uv run server.py   (or: pip install "mcp[cli]>=1.2.0,<3" pyyaml requests && python server.py)
+Claude Code: claude mcp add anchor-prompts -- python /path/to/mcp/anchor-prompts/server.py
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# MCP SDK 2.0 renamed FastMCP to MCPServer and moved it out of
+# `mcp.server.fastmcp`, which no longer exists. The decorator surface this server
+# uses (tool/prompt/resource) and `run()` are identical across both majors, so a
+# two-name shim keeps one implementation working on either — rather than pinning
+# operators to a line that is already end-of-life, or breaking everyone still on v1.
+try:  # SDK 2.x
+    from mcp.server import MCPServer
+except ImportError:  # SDK 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer
+
+
+def _bootstrap_root() -> Path:
+    """Minimal root guess used only to locate ``scripts/`` before anchor_client
+    is importable. Mirrors anchor_client.project_root_from's mcp/ case; REPO is
+    reassigned to the real resolver's output right after the import below."""
+    here = Path(__file__).resolve().parent  # …/mcp/anchor-prompts or …/.anchor/mcp/anchor-prompts
+    if here.parent.name == "mcp" and here.parent.parent.name == ".anchor":
+        return here.parent.parent.parent
+    if here.parent.name == "mcp":
+        return here.parent.parent
+    return here.parents[2]
+
+
+REPO = _bootstrap_root()
+for _scripts in (REPO / ".anchor" / "scripts", REPO / "scripts"):
+    if _scripts.is_dir():
+        sys.path.insert(0, str(_scripts))
+        break
+
+from anchor_client import project_root_from  # noqa: E402
+
+REPO = project_root_from(Path(__file__))
+
+mcp = MCPServer("anchor-prompts")
+
+
+def _read(rel: str) -> str:
+    """Read doctrine from ``anchor/`` (source tree) or ``.anchor/`` (scaffold)."""
+    from anchor_client import resolve_doctrine_path
+    return resolve_doctrine_path(rel, root=REPO).read_text(encoding="utf-8")
+
+
+@mcp.tool()
+def get_doctrine() -> str:
+    """The Anchor doctrine: how to approach any task like a Mythos-class model.
+    Call this at the start of a session and follow it."""
+    return _read("anchor/ANCHOR.md")
+
+
+@mcp.tool()
+def get_system_prompt(model: str = "core") -> str:
+    """Get the Mythos-core system prompt, or a model-specific adaptation.
+    model: core | qwen3 | gemma3 | mistral-small | deepseek-r1-distill | llama33"""
+    if model == "core":
+        return _read("anchor/system-prompts/mythos-core.md")
+    path = REPO / "platforms" / "local-models" / f"{model}.md"
+    if not path.exists():
+        return f"Unknown model '{model}'. Options: core, " + ", ".join(
+            p.stem for p in (REPO / "platforms/local-models").glob("*.md") if p.stem != "README")
+    return path.read_text(encoding="utf-8")
+
+
+@mcp.tool()
+def get_template(name: str) -> str:
+    """Fetch a work template to fill in. name: plan | task-spec | review | verification"""
+    path = REPO / "anchor" / "templates" / f"{name}.md"
+    if not path.exists():
+        return "Unknown template. Options: plan, task-spec, review, verification"
+    return path.read_text(encoding="utf-8")
+
+
+@mcp.tool()
+def tune_prompt(rough_task: str) -> str:
+    """Rewrite a rough task description into a precise Anchor task spec using a cheap
+    fleet model. Use before dispatching work to any expensive or weak model."""
+    from anchor_client import Fleet  # lazy: fleet may not be configured
+    from prompt_tuner import tune
+    try:
+        return tune(rough_task, Fleet())
+    except Exception as e:
+        return (f"Fleet unavailable ({e}). Fill this template yourself instead:\n\n"
+                + _read("anchor/templates/task-spec.md"))
+
+
+@mcp.tool()
+def preflight_check(task_spec: str) -> str:
+    """Deterministically check a task spec for the sections the doctrine requires.
+    Returns PASS or the list of gaps. Run before executing any spec."""
+    required = ["## Goal", "## Files in scope", "## Acceptance criteria", "## Definition of done"]
+    gaps = [s for s in required if s.lower() not in task_spec.lower()]
+    todos = task_spec.count("TODO(")
+    if not gaps and todos == 0:
+        return "PASS — spec is executable."
+    lines = []
+    if gaps:
+        lines.append("MISSING SECTIONS: " + ", ".join(gaps))
+    if todos:
+        lines.append(f"UNRESOLVED TODOs: {todos} — resolve with the task owner before executing.")
+    lines.append("Do not execute this spec. Return it for completion (Anchor rule 1).")
+    return "\n".join(lines)
+
+
+@mcp.prompt()
+def plan_task(goal: str) -> str:
+    """Prompt scaffold: produce an Anchor plan for a goal."""
+    return (f"{_read('anchor/system-prompts/mythos-core.md')}\n\n"
+            f"Your ONLY output is a plan following this template — do not implement.\n\n"
+            f"{_read('anchor/templates/plan.md')}\n\n"
+            f"If the project uses tracked plans under ./.plans, emit the full plan file "
+            f"content ready to save under .plans/drafts/<slug>.md (agents must not "
+            f"promote via /draft --promote <slug> only (infer bugs|features from plan — not from /work), fill "
+            f"Preferred models from complexity, and note that executors start via /work "
+            f"(not by re-deriving the plan from chat).\n\n"
+            f"DEPENDENCIES (required when ./.plans exists): inventory other plans under "
+            f".plans/ (all lanes). For each, consider Goal/Done when and decide whether "
+            f"THIS goal should wait on that work. Fill **Depends on:** with comma-separated "
+            f"slugs (or `none` if you checked and found none). Explain non-obvious deps "
+            f"under ## Depends on (detail). Executors must not start plans with unmet deps.\n\n"
+            f"GOAL: {goal}")
+
+
+@mcp.prompt()
+def critique_work(spec: str, work: str) -> str:
+    """Prompt scaffold: review completed work against its spec, fresh-context critic style."""
+    return (f"{_read('anchor/system-prompts/mythos-core.md')}\n\n"
+            f"You are the critic. Review only; do not fix.\n\n"
+            f"{_read('anchor/templates/review.md')}\n\nSPEC:\n{spec}\n\nWORK:\n{work}")
+
+
+if __name__ == "__main__":
+    mcp.run()

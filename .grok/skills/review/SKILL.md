@@ -1,0 +1,582 @@
+---
+name: review
+description: >
+  Human sign-off for .plans/review-needed/ work: check out the feature branch,
+  run a fresh-context AI critic pass, survey (Approve / Needs Work / Skip), then
+  on Approve merge feature → dev and archive the plan. Empty queue with dev ahead
+  of main offers a promotion review (dev → main). Use when the user runs /review,
+  asks to sign off review-needed plans, or promote integration to mainline.
+argument-hint: "[slug|--list|--skip-ai|--no-launch|--promote|--no-promote|--push]"
+disable-model-invocation: false
+metadata:
+  short-description: "Sign off plan (merge→dev) or promote dev→main"
+---
+
+# /review — human sign-off + integrate
+
+Two modes; single-item mode is **one decision per invocation** (batch mode: one complete decision per plan):
+
+1. **Plan review** — one plan under **`.plans/review-needed/`**: evidence, AI
+   critic, survey. **Approve** merges `feature/<slug>` → **integration**
+   (`dev` / `develop`), then moves the plan to `completed/`.
+2. **Promotion review** — when the plan queue is empty (or `/review --promote`)
+   and integration is **ahead of mainline**: evidence for `main`…`dev`, survey.
+   **Promote** merges integration → **mainline** (`main` / `master`).
+
+**Fleet script paths in this file assume the Anchor source tree's own
+`scripts/`.** This same file is also scaffolded verbatim into every dependent
+project, where fleet tooling lives under **`.anchor/scripts/`** instead —
+substitute that prefix throughout when `scripts/<name>.py` isn't at the
+project root but `.anchor/scripts/<name>.py` is.
+
+This skill **embeds** an AI critic pass; it is not a separate “code review any
+diff” product. For ad-hoc uncommitted/PR review outside these modes, use the
+platform’s code-review tools.
+
+`$ARGUMENTS` is everything after `/review`.
+
+## Usage
+
+| Invocation | Behavior |
+|------------|----------|
+| `/review` | On `main`/`dev` with both a queue **and** integration ahead: ask which to review. Else **batch mode if 2+ eligible plans are queued** (default — see "Batch mode"), single plan mode if only one; else promotion mode if integration ahead of mainline; else stop |
+| `/review <slug>` | Plan session for that `review-needed/` plan |
+| `/review --list` | Inventory queue + one-line “integration ahead of mainline: N” if any; no merge |
+| `/review --skip-ai` | Evidence + survey only (still one decision) |
+| `/review --no-launch` | Skip auto-launch of local systems |
+| `/review --promote` | Force **promotion** mode (refuses if not ahead); ignore plan pick |
+| `/review --no-promote` | Empty queue → stop without offering promotion |
+| `/review --push` | After a **successful local merge**, also offer/confirm `git push` of the updated branch(es) |
+| `/review --batch [N]` | Batch mode with an explicit cap: review up to `N` (default 3) top-priority `review-needed/` plans in one invocation, each with its own full pipeline and its own required survey — see "Batch mode" below. Bare `/review` already batches by default; this only sets `N`. Refuses to combine with `--skip-ai`, a slug, or `--promote`. |
+| `/review --no-batch` (alias `--single`) | Force **single-item** mode for this invocation: one plan **or** one promotion, exactly the pre-batch behavior. Overrides the project/machine setting. Errors if combined with `--batch` |
+
+Flags may combine with a slug: `/review --no-launch my-slug`.
+
+## Hard rules
+
+1. **One decision per invocation in single-item mode; in batch mode, one
+   complete decision per plan.** Single-item mode (a named slug, `--promote`,
+   `--skip-ai`, `--no-batch`/`--single`, fewer than 2 eligible plans, or batching
+   switched off by setting) is exactly the pre-batch behavior: either one plan
+   review **or** one promotion review, never both, never auto-start the next plan;
+   footer may note remaining queue count only. **Batch mode is the default for
+   bare `/review` when 2+ plans are eligible**: it repeats the full per-plan
+   pipeline (including a **required, never-inferred survey per plan** — see
+   "Batch mode" below) up to `N` times in one invocation. Promotion review is never
+   batched — see Batch mode.
+2. **Pipeline order** (plan mode):
+
+   ```text
+   select → checkout (if safe) → evidence + optional launch
+          → AI code review (fresh context)
+          → present package
+          → survey → follow-ups
+          → merge feature → integration (on Approve)
+          → lane move to completed/ (only after merge success or “nothing to merge”)
+   ```
+
+   Promotion mode:
+
+   ```text
+   detect empty queue + ahead → evidence (log/shortstat)
+        → optional AI on mainline..integration
+        → survey Promote / Skip / Defer
+        → merge integration → mainline (on Promote)
+   ```
+
+   Do **not** open the survey before the AI pass finishes (or a clear
+   “AI pass skipped/failed: …” message), unless `--skip-ai`.
+3. **AI is advisory.** Never auto-approve/reject. Survey is authoritative.
+4. **`review-needed/` → `completed/`** only after survey **Approve** (+
+   override follow-up when AI was REVISE/ESCALATE) **and** the feature→integration
+   merge succeeded (or there was nothing to merge). Re-prompt on ambiguous free text.
+5. **Needs Work** → **`bugs/` or `features/`** (inferred), **never**
+   `in-progress/`. Actionable notes required first. **No merge** on Needs Work.
+6. **Merge only after human survey Approve / Promote.** Never merge on AI ACCEPT
+   alone. **Never force-push. Never delete branches** unless the human explicitly
+   asks after a successful merge (default: leave `feature/<slug>`). **Push to
+   `origin` only** with confirm after local success, or when `--push` was set
+   (still confirm once). Default is **local merge only**.
+7. Preserve basenames (including `.local.md`) on every move.
+8. **Executors never merge; `/work` may land only what its operator just watched.**
+   A `/work` session may merge `feature/<slug>` → **integration only**, and only
+   when the operator answers its end-of-run culmination question in-session *and*
+   the branch passes the scoped-merge gate (`scripts/merge_feature.py`). Unattended
+   and fleet runs never merge, and **this skill is the only route to `main`** —
+   a plan arriving in `review-needed/` was not merged by `/work`. Only this skill
+   after survey may land
+   branches on integration/mainline.
+
+## Integration / mainline resolution
+
+Same order as `scripts/worktree_for_agent.py` / `scripts/pending_merges.py`:
+
+| Role | Candidates (first that exists) |
+|------|--------------------------------|
+| **Integration** | `dev`, then `develop`. If neither exists, **create `dev`** from mainline (`main`, else `master`) before merging. |
+| **Mainline** | `main`, then `master` |
+
+Optional ahead advisory: `python scripts/pending_merges.py` (feature→integration
+and integration→mainline rows).
+
+## 1. Resolve project
+
+Find a root with `.plans/` (CWD, then git root). Print the absolute path.
+If missing: explain and stop.
+
+**Release completion check** (interactive only; skip on unattended runs, same
+gating as `/work`'s culmination question):
+`python scripts/release_progress.py --list --root .`. A `Status: open` release with
+all members in `completed/` → ask **once** whether to prepare it for deployment,
+then `--mark-ready <slug>` on any answer. Never auto-run `/release`, never let it
+change mode selection. Detail: `python scripts/release_progress.py --help`,
+or https://carefreeinv.com/anchor/tooling/scripts
+
+## 2. Select mode and target
+
+Parse flags: `--list`, `--skip-ai`, `--no-launch`, `--promote`, `--no-promote`,
+`--push`, `--batch [N]`, `--no-batch` (alias `--single`), optional slug.
+
+**Resolve whether batching is on** (bare `/review` only; run
+`anchor --show-review-batch` for the answer and its source, or apply this
+order yourself — first hit wins):
+
+1. `--no-batch` / `--single` → **off**; `--batch [N]` → **on** (both together: usage
+   error — state why, stop).
+2. The project convention `**Review batch:** on | off` in `.anchor/conventions.md`.
+3. The machine default `REVIEW_BATCH=on|off` in `~/.config/anchor/defaults`
+   (`$ANCHOR_CONFIG_DIR`).
+4. **on** — the built-in default for now.
+
+An unrecognised value is ignored (falls through to the next source), never guessed.
+Set them with `anchor --set-review-batch on|off` (project) or
+`./config.sh --review-batch on|off` (machine).
+
+**Batching applies only to a bare plan-queue review.** A named slug, `--promote`,
+`--skip-ai`, or `--no-batch` is single-item mode — silently, with no error — because
+each names one target or skips the critic a batch requires. An **explicit**
+`--batch [N]` combined with `--skip-ai`, a slug, or `--promote` is a usage error
+(state why, stop): the human asked for two contradictory things. When batching is
+on and the queue is eligible, see **Batch mode** below instead of the single-pick
+steps that follow.
+
+**`--list`:** list each `review-needed/*.{md,local.md}` (skip `.gitkeep`): path,
+Priority, Value, Goal one-liner, whether `feature/<slug>` exists. Also print one
+line: `integration (<name>) ahead of mainline (<name>): N commits` (or `0` /
+not a git repo). Stop — no checkout, AI, survey, or merge.
+
+**`--promote`:** skip plan selection; go to **§ Promotion review**. If
+integration is not ahead of mainline, report and stop.
+
+**Named slug:** resolve under `review-needed/` only. Other lane → refuse with
+the right command pointer. Plan mode.
+
+**Bare `/review`:**
+
+1. **Branch-aware ask.** If HEAD is on mainline or integration (`main`/`master`
+   or `dev`/`develop`) **and both review paths are live** — a non-empty
+   `review-needed/` queue **and** integration ahead of mainline — don't
+   silently pick a direction; **ask** (`ask_user_question` when available):
+
+   | Option | Meaning |
+   |--------|---------|
+   | **Review `dev` for promotion** | Promotion mode on `<mainline>..<integration>`; Promote merges integration → mainline |
+   | **Review a feature branch** | List each `review-needed/` plan (slug, Priority, Value, whether `feature/<slug>` has commits not in integration). With batching on and 2+ eligible, this opens the batch (overview first) instead; otherwise the human picks **one** → plan mode for that pick |
+
+   One entry in a list of one is not a choice — a single queued plan is picked
+   without a sub-menu. Hard rule 1 stands: **promotion and plan review are never
+   combined in one invocation**; reviewing the other kind means re-running `/review`.
+2. If only the queue is live (or HEAD is on some other branch): with batching on
+   (see above), follow **Batch mode** — it falls back to single-item mode with a
+   one-line reason when fewer than 2 plans are eligible. With batching off (or
+   `--no-batch`), pick **one** by Priority (P1→P3, default P2) → Value
+   (high→low, default medium) → oldest mtime → filename. State why it won. Other
+   queued plans: **one line** only. Plan mode.
+3. Else if `--no-promote`: report empty queue; stop.
+4. Else if integration is ahead of mainline: **promotion mode** (§ Promotion).
+5. Else: report empty queue + nothing to promote; optional `pending_merges.py`
+   one-liner; stop.
+
+A named slug or `--promote` is already an explicit direction — no ask.
+
+## Batch mode (default for bare `/review`; `--batch [N]` sets the cap)
+
+**On by default** — a trial; the docs may revert it. Batch mode chains **N
+complete, independent** review cycles in one invocation — it does not introduce a
+batched AI verdict or a batched merge. Switch it off per run with `--no-batch`, or
+persistently with `anchor --set-review-batch off` / `./config.sh --review-batch off`.
+Never applies to promotion review: batch mode on an empty `review-needed/` queue
+falls through to bare promotion mode exactly as single-item `/review` does (one
+decision).
+
+**1. Build the candidate pool.** Same Priority → Value → oldest-mtime order
+the single-item picker already uses — no second ranking scheme.
+
+**2. Appropriateness check — refuse per-candidate, not the whole batch, with
+a concrete reason:**
+
+- **Hold note:** a candidate's `## Handoff` section starts `hold —` → excluded,
+  reason `held for testing`.
+- **Large diff:** `git diff --shortstat` vs integration exceeds **8 files**
+  or **±300 lines** net → excluded, reason `large diff — review single-item`.
+- **Interdependent with another candidate:** two candidates conflict if any
+  entry in one plan's Steps `Touches` columns / `## Likely touch points`
+  either exactly matches an entry in the other's, or names a directory that
+  contains one of the other's file entries (symbol suffixes like
+  `: func()` stripped before comparing — the file is the unit of conflict,
+  not the symbol). This is the same overlap rule `/work --batch`'s
+  `scripts/batch_dispatch.py` applies for parallel *execution* — restated
+  here in prose so this check is self-contained and doesn't depend on that
+  script existing or being merged; if both ever need to change, keep them in
+  sync deliberately rather than assuming one implies the other. Both
+  excluded, reason `interdependent with <other slug> — review in dependency
+  order`.
+- Fewer than **2** eligible candidates after filtering → do not batch; fall back
+  to single-item mode with a one-line reason (not an error, whether batching was
+  the default or explicit).
+
+**3. Cap:** take the top `N` eligible candidates (default **3**) by the same
+ordering. `N` above the default is allowed only when the human passed it
+explicitly — never auto-raised.
+
+**4. Present the queue overview before starting** — every plan the batch
+will cover (slug · Priority · Value · one-line Goal), plus every excluded
+candidate and its reason. The human sees the whole batch before the first
+survey question, not one item at a time. Close the overview with one line saying
+how this batch was chosen and how to opt out, e.g.
+`batch mode: on (source: built-in default) — /review --no-batch to review one at a time`
+(use the source `anchor --show-review-batch` reports; say `explicit --batch` when the
+human passed the flag).
+
+**5. Run the existing per-plan pipeline once per candidate, in order,
+unchanged in shape:**
+
+```text
+select (from the pre-batch snapshot) → checkout (if safe) → evidence
+  → fresh-context AI critic (never shared context with a sibling item)
+  → present package → survey (Approve / Needs Work / Skip / Defer)
+  → follow-ups → merge (Approve only) → lane move → next item
+```
+
+The survey is **required per item, never skipped, never inferred** from
+earlier items in the same batch — "the last two were Approve" is not a
+reason to stop asking. Each item's fresh-context critic runs independently;
+no shared context between siblings (Anchor self-review rule, same as
+single-item mode).
+
+**6. Abort mid-batch is always available.** The human may stop after any
+item's survey. Already-completed items' merges/lane-moves stand (each was
+independently confirmed); remaining items return to `review-needed/`
+untouched — report which items landed and which didn't.
+
+**7. Footer** notes the batch outcome per item (Approved+merged / Needs
+Work / Skipped / Deferred), not just a single decision line, and whether batch
+mode was the default or explicit (`--batch`). A run of instant Approves with no
+critic findings read is worth naming in the footer — batching removes re-typing
+`/review`, never the per-plan sign-off.
+
+## 3. Load plan (plan mode)
+
+Read fully. Restate Goal, Done when, Preferred models, Progress ≤15 lines.
+Slug = filename without `.md` / `.local.md`.
+
+## 4. Branch checkout (safe only, plan mode)
+
+Branch name: `feature/<slug>` (same rules as
+`scripts/worktree_for_agent.feature_branch_name`).
+
+| Situation | Action |
+|-----------|--------|
+| Already on branch | Leave it; report status |
+| Clean tree + local branch | `git checkout feature/<slug>` |
+| Clean tree + remote only | Tracking checkout from `origin/feature/<slug>` |
+| Dirty tree | **Do not** switch; offer `python scripts/worktree_for_agent.py ensure --project <root> --agent-id review --slug <slug>` or stop |
+| Missing branch | Continue with plan + available refs; never invent a branch |
+
+Report `git status` and shortstat vs integration.
+
+## 5. Evidence pack (plan mode)
+
+- Diff summary vs integration (files, shortstat, themes)
+- Done when checklist for human judgment (do not auto-tick)
+- PR URL if `gh pr view` works
+- Verification notes from plan Progress if present
+- Whether `feature/<slug>` has commits not in integration (`git rev-list --count <integration>..feature/<slug>`)
+
+## 6. Launch (unless `--no-launch`, plan mode)
+
+Scoped to this plan’s touches:
+
+- **Auto-launch OK:** docs `npm start`, clear local `dev` without destructive
+  pre-steps. Background preferred; report URL + stop instructions.
+- **Confirm first / print-only:** Docker Compose, migrations, privileged
+  ports, remote deploys, `sudo`, destructive resets.
+- Nothing useful → one line “no launch.”
+
+Survey waits until AI pack is ready (or skip/fail stated).
+
+## 7. AI code review (unless `--skip-ai`)
+
+**Fresh context required.** Spawn a **read-only** reviewer subagent
+(`spawn_subagent`, `subagent_type: general-purpose`, description prefix
+`[reviewer]`). The orchestrator must not sole-author the verdict.
+
+**Subagent prompt must include:**
+
+- Plan Goal, Done when, Constraints (and Progress verification notes)
+- How to collect the diff: merge-base of integration vs `feature/<slug>`
+  (or current HEAD if already checked out)
+- Output format from `.anchor/templates/review.md` if present, else
+  `anchor/templates/review.md`: checklist; **Verdict** ACCEPT | REVISE |
+  ESCALATE; structured findings (severity, file:line when known)
+- **Read-only:** no product file edits; findings only
+
+On spawn/empty failure: “AI pass skipped/failed: …” then continue.
+
+## 8. Present package (plan mode)
+
+1. Plan identity (path, slug, Goal)
+2. **`## Handoff` note, when the plan body has one** — a `hold — <reason> — <date>`
+   line means the operator parked this deliberately for testing; lead with it, since
+   the reason is usually what to check before approving
+3. Evidence (diff, Done when, PR/URLs, commits ahead of integration)
+4. AI verdict + top findings (or skip/fail)
+5. How to exercise the system
+6. Note: **Approve will merge `feature/<slug>` → integration, then archive**
+
+## 9. Survey (plan mode)
+
+Prefer `ask_user_question` (or equivalent) with options:
+
+| Option | Meaning |
+|--------|---------|
+| **Approve** | Done when holds; merge feature → integration; archive |
+| **Needs Work** | Changes required — return to ready queue (no merge) |
+| **Skip** | Leave in `review-needed/` (no merge) |
+| **Defer** (optional) | → `blocked/` only if confirmed (no merge) |
+
+Re-prompt when free text is ambiguous. Sole plan + explicit
+“approve \<slug\>” may count as Approve.
+
+## 10. Follow-ups (plan mode)
+
+One short round (+ one retry if unusable):
+
+| Choice | Follow-ups |
+|--------|------------|
+| **Approve** | If AI REVISE/ESCALATE: required override confirmation with top issues. Optional note if ACCEPT. |
+| **Needs Work** | Required actionable bullets; 1–3 clarifying prompts if vague. Write into plan `## Progress` / `## Review notes` **before** move. |
+| **Skip** | Optional reason. |
+| **Defer** | Blocker + unblock condition required. |
+
+Empty Needs Work feedback → refuse move; stay in `review-needed/`.
+
+## 11. Merge feature → integration (Approve only)
+
+**Only after** survey Approve (+ required override). Order is hard:
+
+1. **Clean tree required.** If dirty: stop; leave plan in `review-needed/`; no merge.
+2. Resolve integration branch (create `dev` from mainline if needed).
+3. If no `feature/<slug>` (local or remote): **skip merge**; note “no branch to
+   merge”; proceed to lane move.
+4. If `git rev-list --count <integration>..feature/<slug>` is `0`: skip merge;
+   note “already on integration”; proceed to lane move.
+5. Otherwise, with a clean tree. **Fast-forward first — it creates no commit**,
+   so its content is byte-identical to what was already prepped on the branch and
+   needs no further gate:
+
+   ```bash
+   git checkout <integration>
+   git merge --ff-only feature/<slug>
+   ```
+
+   If that fails (not FF-able), the merge **creates a commit**, and a commit needs
+   **`/commit-prep`** first (see the platform brief's hard rule). A clean textual merge
+   can still be semantically broken, and the merged tree is state neither branch
+   was prepped in — so stage the merge, prep *that*, and only then commit:
+
+   ```bash
+   git merge --no-ff --no-commit feature/<slug>   # stage it; do not commit yet
+   # run /commit-prep against the merged working tree
+   #   green → git add -A && git commit -m "Merge feature/<slug>: <plan title>"
+   #            (-A matters: prep EDITS the working tree; a bare `git commit`
+   #             commits only the index and drops prep's own output)
+   #   red   → git merge --abort || git reset --hard HEAD
+   ```
+
+   `git add -A` stages **every** untracked file in the tree, not only what prep
+   produced. Before running it, check `git status` and confirm the untracked set is
+   prep's output (a CHANGELOG edit, a new blog post) and not a stray scratch file,
+   a local config, or build output — a merge commit is the worst place to discover
+   one. Stage prep's reported paths explicitly if the tree is not clean.
+
+   **Red prep on the staged merge:** abort, leave the plan in `review-needed/`, and
+   report which gate failed. Note `git merge --abort` **refuses** when prep modified
+   a file involved in the merge (`error: Entry '<path>' not uptodate`) — which is
+   precisely what its fix-the-tests gate does — so fall back to
+   `git reset --hard HEAD`. Either way nothing was **committed**. Prep's edits to
+   *tracked* files go with the merge, but a file prep **created** — typically a new
+   blog post — is untracked and `reset --hard` leaves it in place. Check
+   `git status`, then say which of prep's output survived rather than "nothing to
+   undo" or "everything is gone".
+
+6. **On conflict:** `git merge --abort` if in progress; leave plan in
+   `review-needed/`; report conflict paths; **do not** move to `completed/`.
+7. **On success:** report new HEAD of integration; then lane move (§12).
+8. **Push:** only if `--push` or human confirms after local success:
+   `git push origin <integration>`. Never force-push. Hook rejection → surface
+   output; do not retry with `--no-verify`.
+
+Prefer a dedicated clean worktree for the merge if the current tree holds
+another branch checked out in a second worktree that blocks checkout.
+
+## 12. Lane moves (plan mode)
+
+**Lane moves are commits too — `/review` makes them, and does not leave them
+staged.** A scaffolded project **tracks** `.plans/` (only `*.local.md` and
+`.leases/` are ignored), so a lane move is a real tracked change; leaving it staged
+is how plan bookkeeping ends up in somebody's next unrelated commit.
+
+A commit whose paths are **entirely** under `.plans/` takes the **light path**:
+state what moved and why, then commit. No CHANGELOG, no blog, no test run. If
+`.plans/` is untracked here, say "lane move (untracked)" and commit nothing.
+
+```bash
+git add .plans/
+git commit -m "Plans: <slug> → <lane> (/review <choice>)" -- .plans/
+```
+
+The `-- .plans/` pathspec is load-bearing: a bare `git commit` commits **everything
+already in the index**, so an unrelated pre-staged file would land under the light
+path with no tests, no CHANGELOG and no blog decision. If `git diff --cached
+--name-only` lists anything outside `.plans/`, this is not a plans-only commit —
+stop and run the full gate.
+
+**Never take the light path while a merge is staged.** A pathspec commit is a
+*partial* commit, and git refuses one mid-merge:
+
+```text
+fatal: cannot do a partial commit during a merge.
+```
+
+The tempting repair — dropping `-- .plans/` so the command succeeds — is the worst
+available outcome: it commits the **entire staged merge** under a `Plans:` message,
+ungated. Finish or abort the merge first (§11 step 5), then move the lane and commit
+it separately. `git rev-parse -q --verify MERGE_HEAD` succeeding means a merge is
+still in progress; the merge commit and the lane move are always **two** commits.
+
+| Choice | Move |
+|--------|------|
+| **Approve** (merge OK or nothing to merge) | → `completed/` (optional `YYYY-MM-DD-` prefix); drop stale lease if any; **then commit it** (light path) |
+| **Approve** (merge required and failed) | **No move** — stay in `review-needed/` |
+| **Needs Work** | → **`bugs/` or `features/`** (same basename); **never** `in-progress/`; write the actionable notes first; **then commit it** (light path) |
+| **Skip** | No move |
+| **Defer** | → `blocked/` with note; **then commit it** (light path) |
+
+### Needs Work → bugs vs features
+
+Same table as **`/draft --promote`**:
+
+| Prefer `bugs/` when… | Prefer `features/` when… |
+|----------------------|---------------------------|
+| Fix / regression / crash / incorrect behavior | New capability, add/support/enable |
+| Repair existing behavior | Header **Value:** high\|medium\|low |
+| Pure defect language in Goal | Expansion of product surface |
+
+Human override wins; if ambiguous ask once; refuse if target basename exists;
+footer states lane + reason.
+
+---
+
+## Promotion review (empty queue or `--promote`)
+
+### When
+
+- `review-needed/` has no plans (or `--promote` forces this path), **and**
+- integration exists and `git rev-list --count <mainline>..<integration>` > 0
+
+If not ahead: report and stop (with `--promote`, say why).
+
+### Evidence
+
+- `git log --oneline <mainline>..<integration>`
+- `git diff --stat <mainline>...<integration>`
+- Optional: `python scripts/pending_merges.py` table
+- Optional AI critic (`--skip-ai` to skip) on that range — same
+  `templates/review.md` verdict shape; advisory only
+
+### Survey
+
+| Option | Meaning |
+|--------|---------|
+| **Promote to main** | Merge integration → mainline |
+| **Skip** | Leave branches as-is |
+| **Defer** | Note only; no merge |
+
+### Merge integration → mainline (Promote only)
+
+1. Clean tree required; else stop.
+2. Fast-forward first — it creates no commit and needs no further gate:
+
+   ```bash
+   git checkout <mainline>
+   git merge --ff-only <integration>
+   ```
+
+   If not FF-able the merge **creates a commit on mainline**, the one branch no
+   other path can reach, so gate it **before it exists**:
+
+   ```bash
+   git merge --no-ff --no-commit <integration>
+   # run /commit-prep against the merged working tree
+   #   green → git add -A && git commit -m "Merge <integration> into <mainline>"
+   #   red   → git merge --abort || git reset --hard HEAD; report the failing
+   #            gate, promote nothing. Prep's *tracked* edits go with the merge;
+   #            a file it created (new blog post) is untracked and survives —
+   #            `git status`, then keep or remove it deliberately.
+   ```
+3. Conflict → abort; no push; report files.
+4. Success → report SHAs. Push `origin <mainline>` only with confirm / `--push`.
+5. If mainline has commits not in integration (diverged): prefer attempting the
+   merge; if messy, **stop and report** (“integrate main→dev first”) rather than
+   inventing policy — do not force.
+
+No plan lane moves in promotion mode.
+
+---
+
+## 13. Footer
+
+```text
+## Result
+## How to verify
+## Deferred / concerns
+```
+
+Include: mode (plan vs promotion), final plan path if any, AI verdict, survey
+choice, merge result (SHAs / skipped / conflict), push done or not, remaining
+queue count. **Do not** start the next plan or chain into promotion after a plan
+Approve in the same invocation (human re-runs `/review`).
+
+## Out of scope
+
+- Executing plan Steps (`/work`)
+- Promoting drafts
+- Merging without survey Approve/Promote
+- Multi-plan sessions **outside batch mode** (see "Batch mode": on by default for
+  bare `/review`, off with `--no-batch`) — every item in a batch still gets its own
+  full pipeline and its own required survey
+- AI auto-Approve without survey
+- Needs Work → `in-progress/`
+- Force-push, `--no-verify`, deleting feature branches by default
+- Release tags / version bumps on main merge
+
+## Quick discovery
+
+```bash
+ls -la .plans/review-needed
+ls .plans/bugs .plans/features .plans/in-progress \
+   .plans/completed 2>/dev/null
+python scripts/pending_merges.py
+git rev-list --count main..dev 2>/dev/null
+```

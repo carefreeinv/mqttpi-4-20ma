@@ -1,0 +1,7 @@
+# Private/dev plans — stay untracked. Use <slug>.local.md in any lane.
+# Tracked plans use <slug>.md (no .local). See README.md.
+**/*.local.md
+
+# Plan claim leases (required ownership of in-progress plans; local coordination
+# state, not tracked). Written atomically with the move into in-progress/.
+.leases/

@@ -1,0 +1,52 @@
+# Anchor fleet registry. All endpoints are OpenAI-compatible (/v1/chat/completions).
+# tiers: swarm (tiny executors) | executor (mid) | executor-heavy | reasoner | frontier | detached
+#
+# work_once.py maps registry tiers → Preferred-models fit tiers:
+#   swarm→small, executor|executor-heavy|detached→mid, reasoner→reasoner, frontier→frontier
+# Example: python scripts/work_once.py --once --endpoint h100-executor --registry scripts/endpoints.yaml
+#
+# quirks (full reference in anchor_client.py; per-model guidance in platforms/local-models/):
+#   system_role: fold_into_user      Gemma 3 (no system slot) AND DeepSeek-R1 distills
+#                                    (official guidance: no system prompt)
+#   think_toggle: qwen3 | nemotron   hybrid-reasoning switch; implies <think> stripping
+#   strip_think: true                strip <think>...</think> from output
+#   system_suffix: '<one line>'      per-model guardrail appended to the system text
+#                                    (Gemma BLOCKED rule, R1 LOW-CONFIDENCE rule —
+#                                    `fit_device.py` emits these for you)
+#   temperature / temperature_thinking   default sampling per mode (Mistral: 0.15;
+#                                    Nemotron thinking-off: 0 for greedy)
+#   sampling / sampling_thinking     extra params, e.g. {top_p: 0.95, top_k: 20}
+#   max_context: <n>                 serving context ceiling; completion capped to it
+#   min_completion_tokens: <n>       floor for max_tokens (thinking locals / Ollama)
+#   openai_think: true|false         Ollama opt-in only; 400 → drop + cache skip
+endpoints:
+  - name: h100-executor
+    tier: executor-heavy
+    base_url: http://10.0.1.10:8000/v1
+    model: Qwen/Qwen3-32B-FP8
+    quirks:
+      think_toggle: qwen3
+      strip_think: true
+      min_completion_tokens: 256
+      sampling_thinking: {top_p: 0.95, top_k: 20}   # official Qwen3 thinking-mode rec
+
+  - name: h100-nemotron
+    tier: reasoner
+    base_url: http://10.0.1.11:8000/v1
+    model: nvidia/llama-3.3-nemotron-super-49b-v1
+    quirks:
+      think_toggle: nemotron
+      temperature: 0        # NVIDIA rec: greedy when thinking is off (thinking-on stays 0.6)
+
+  - name: space1-rubin-1
+    tier: detached
+    base_url: http://10.9.0.10:8000/v1
+    model: local-reasoner
+    quirks: {hold_on_fail: true}
+
+# Which tier serves each role, in preference order.
+roles:
+  tuner: [swarm, executor]
+  executor: [executor, executor-heavy, swarm]
+  critic: [reasoner, executor-heavy]
+  planner: [frontier, reasoner]

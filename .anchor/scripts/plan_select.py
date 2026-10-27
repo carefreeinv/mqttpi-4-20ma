@@ -1,0 +1,1311 @@
+#!/usr/bin/env python3
+"""Shared plan selection for `/work` and headless `work_once.py`.
+
+Path is authoritative:
+
+  - drafts/ — not ready (never execute)
+  - bugs/, features/ — ready (pick by priority + fit)
+  - in-progress/ — claimed; **only the agent holding the lease** may work it.
+    Bare pick never scans this lane — resuming your own work is an explicit
+    named claim, not a side effect of `/work`.
+  - ambiguous/ — half-baked (never auto-execute; agent may park here)
+  - blocked/ — cannot proceed (never auto-execute; agent may park here)
+  - review-needed/ — required agent finish when Done when holds; awaiting
+    human /review (never auto-execute; agents must not archive to completed/)
+  - completed/ — archive after human /review Approve (never execute)
+
+Priority for bare pick (ready lanes only — in-progress is never bare-picked):
+
+  1. All bugs/*.md before any feature
+  2. within a lane by Priority P1 → P2 → P3 (default P2), then Value high →
+     medium → low (default medium), then oldest first (mtime), then filename
+  3. Model-fit filter unless no_fit_check or explicit slug/path override
+  4. Skip plans with **unmet Depends on** unless no_dep_check
+
+A named in-progress plan resolves only if **you hold its active lease**. A
+foreign, unleased, or expired-lease in-progress plan is refused — there is no
+silent reclaim; crashed work is recovered explicitly or by a human. Ignore
+every in-progress plan you do not own.
+
+**Depends on:** header slugs (or ``none``). A dependency is met if the slug is only
+under completed/ (or git history shows it was removed from completed/), and is not
+still open in another lane. Coordinators should scan existing plans when drafting
+to propose Depends on; executors must not start work with unmet deps.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, replace
+from enum import Enum
+from pathlib import Path
+
+from plan_parse import GOAL_RE, has_goal_section, safe_read_text, strip_code_fences
+
+READY_LANES = ("bugs", "features")
+IN_PROGRESS_LANE = "in-progress"
+PARK_LANES = frozenset({"ambiguous", "blocked"})
+# Agent-flagged-done, awaiting human sign-off. Distinct from PARK_LANES: park
+# lanes return to bugs|features when unblocked; review-needed instead moves on
+# to completed/ (human-only) or back to in-progress/bugs/features. Never
+# auto-picked/executed either way.
+REVIEW_LANE = "review-needed"
+EXECUTABLE_LANES = (*READY_LANES, IN_PROGRESS_LANE)
+# Never pick/execute these (parked + awaiting-review + draft + archive)
+NON_EXECUTABLE_LANES = frozenset({"drafts", "completed", "ambiguous", "blocked", REVIEW_LANE})
+# Back-compat alias used by assert helpers
+BLOCKED_LANES = NON_EXECUTABLE_LANES
+VALUE_RANK = {"high": 0, "medium": 1, "low": 2}
+PRIORITY_RANK = {"P1": 0, "P2": 1, "P3": 2}
+DEFAULT_PRIORITY = "P2"
+FIT_TIERS = ("small", "mid", "reasoner", "frontier")
+FIT_RANK = {t: i for i, t in enumerate(FIT_TIERS)}
+
+# Map endpoints.yaml / fleet tiers → Preferred-models fit tiers.
+REGISTRY_TIER_TO_FIT: dict[str, str] = {
+    "swarm": "small",
+    "executor": "mid",
+    "executor-heavy": "mid",
+    "reasoner": "reasoner",
+    "frontier": "frontier",
+    "detached": "mid",
+}
+
+# Reasoning-effort dial, cheapest first. Products expose different subsets
+# (`none`/`minimal` are not universal); unknown names classify as UNKNOWN rather
+# than guessing a rank.
+EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh")
+EFFORT_RANK = {e: i for i, e in enumerate(EFFORT_LEVELS)}
+
+# Plan's highest Preferred tier → the effort band that tier's work deserves.
+# This is the /work "same-model cost right-size" table as data. First entry of
+# each band is the recommended setting (cheapest that still does the job).
+TIER_EFFORT: dict[str, tuple[str, ...]] = {
+    "small": ("low", "minimal", "none"),
+    "mid": ("low", "medium"),
+    "reasoner": ("high",),
+    "frontier": ("high", "xhigh"),
+}
+
+VALUE_RE = re.compile(r"^\s*-\s*\*\*Value:\*\*\s*(\w+)", re.MULTILINE | re.IGNORECASE)
+PRIORITY_RE = re.compile(
+    r"^\s*-\s*\*\*Priority:\*\*\s*(\S+)", re.MULTILINE | re.IGNORECASE
+)
+PREFERRED_RE = re.compile(
+    r"^\s*-\s*\*\*Preferred models:\*\*\s*(.+)$", re.MULTILINE | re.IGNORECASE
+)
+# Optional `- **Assignee:** …` header. Defaults to **ai** when absent — the
+# framework's whole premise is that agents do the work. The value may be a
+# person's name, username, or email; only an explicit AI token (or absence)
+# means "any agent may take this". A plan assigned to a *named someone* is theirs
+# to complete: no agent auto-claims or executes it, regardless of fit. Agents may
+# still read it and edit its body (status/comments) and commit that; they just
+# never move it to in-progress/completed themselves.
+#
+# Deliberately conservative: we recognize the safe set (AI tokens + absence) and
+# treat everything else as assigned-away. A model *name* belongs in Preferred
+# models, not here — Assignee is human-vs-agent ownership, not routing.
+ASSIGNEE_RE = re.compile(
+    r"^\s*-\s*\*\*Assignee:\*\*\s*(.+)$", re.MULTILINE | re.IGNORECASE
+)
+# First token of the Assignee value (before any note) that means "any agent may
+# take this". Absence means the same. Anything else is a specific assignee.
+AGENT_ASSIGNEE_TOKENS = frozenset(
+    {"ai", "agent", "agents", "bot", "llm", "auto", "any", "anyone",
+     "unassigned", "none", "-"}
+)
+DEPENDS_RE = re.compile(
+    r"^\s*-\s*\*\*Depends on:\*\*\s*(.+)$", re.MULTILINE | re.IGNORECASE
+)
+DEPENDS_SECTION_RE = re.compile(
+    r"^##\s+Depends on(?:\s*\(detail\))?\s*$([\s\S]*?)(?=^##\s|\Z)",
+    re.MULTILINE | re.IGNORECASE,
+)
+DEPENDS_BULLET_RE = re.compile(
+    r"^\s*-\s*`?([a-zA-Z0-9][a-zA-Z0-9._/-]*)`?",
+    re.MULTILINE,
+)
+TITLE_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
+# Optional `- **Release:** <slug>` header — points a plan at a
+# `.plans/.releases/<slug>.md` file (see release_progress.py / .plans/README.md
+# "## Releases"). The release file never lists members; this is the only
+# direction membership is stored, so both plan_select.py's tiebreak and
+# release_progress.py's completion scan share this one parser.
+RELEASE_RE = re.compile(r"^\s*-\s*\*\*Release:\*\*\s*(\S+)", re.MULTILINE | re.IGNORECASE)
+# A real release slug looks like a filename stem (word chars, dots, hyphens).
+# Guards against an unrelated pre-existing convention some plans use — citing
+# a product release announcement as `- **Release:** [Introducing Foo](url) —
+# ...` in prose. A bracket/paren/space means "not a slug," not "not tagged."
+_RELEASE_SLUG_SHAPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_RELEASE_NONE_TOKENS = frozenset({"none", "n/a", "-", "nil", "null"})
+
+
+def parse_release_field(text: str) -> str | None:
+    """The plan-header ``Release:`` value, or ``None`` when absent/none/not slug-shaped."""
+    m = RELEASE_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1).strip().strip("`")
+    if not raw or raw.lower() in _RELEASE_NONE_TOKENS:
+        return None
+    if not _RELEASE_SLUG_SHAPE_RE.match(raw):
+        return None
+    return raw
+# Lanes where a dependency slug still counts as unfinished work
+OPEN_LANES = (
+    "drafts",
+    "bugs",
+    "features",
+    "in-progress",
+    "ambiguous",
+    "blocked",
+    REVIEW_LANE,
+)
+
+
+class Fit(str, Enum):
+    GOOD = "good"
+    OVERQUALIFIED = "overqualified"
+    UNDERQUALIFIED = "underqualified"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class Worker:
+    """Identity used for Preferred-models matching."""
+
+    name: str
+    tier: str  # small | mid | reasoner | frontier
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tier", normalize_fit_tier(self.tier))
+
+
+@dataclass(frozen=True)
+class PlanRecord:
+    path: Path  # absolute
+    rel: str  # e.g. features/foo.md relative to .plans/
+    lane: str
+    slug: str
+    value: str
+    priority: str
+    preferred: str | None
+    title: str
+    fit: Fit = Fit.UNKNOWN
+    owner: str | None = None  # lease agent_id when known
+    depends_on: tuple[str, ...] = ()
+    deps_met: bool = True
+    deps_unmet: tuple[str, ...] = ()
+    deps_notes: tuple[str, ...] = ()  # human-readable check notes
+    assignee: str | None = None  # raw Assignee value; None == unset (agent-eligible)
+    agent_assignable: bool = True  # False when assigned to a named person
+    parse_error: str | None = None  # set when the file could not be read at all
+    has_goal: bool = True  # False when ## Goal is missing/empty (daemon triage: reject)
+    release: str | None = None  # optional Release: header value (see release_progress.py)
+
+    @property
+    def ready(self) -> bool:
+        return self.lane in READY_LANES
+
+
+def normalize_fit_tier(tier: str) -> str:
+    t = (tier or "mid").strip().lower()
+    if t in FIT_RANK:
+        return t
+    mapped = REGISTRY_TIER_TO_FIT.get(t)
+    if mapped:
+        return mapped
+    return "mid"
+
+
+
+def plans_root_for(project_root: Path) -> Path:
+    return project_root / ".plans"
+
+
+def plan_slug(path: Path) -> str:
+    name = path.name
+    if name.endswith(".local.md"):
+        return name[: -len(".local.md")]
+    if name.endswith(".md"):
+        return name[:-3]
+    return path.stem
+
+
+def parse_value(text: str) -> str:
+    m = VALUE_RE.search(text)
+    if not m:
+        return "medium"
+    v = m.group(1).lower()
+    return v if v in VALUE_RANK else "medium"
+
+
+def parse_priority(text: str) -> str:
+    """Parse the ``Priority:`` header → ``P1|P2|P3``; tolerant, default ``P2``.
+
+    Accepts ``P1``/``p1``/``1`` and trailing junk (``P1.``, ``P2 — note``).
+    Anything unrecognized falls back to the default priority.
+    """
+    m = PRIORITY_RE.search(text)
+    if not m:
+        return DEFAULT_PRIORITY
+    raw = m.group(1).strip().strip("`").upper()
+    m2 = re.match(r"P?([123])", raw)
+    if m2:
+        return f"P{m2.group(1)}"
+    return DEFAULT_PRIORITY
+
+
+def parse_preferred(text: str) -> str | None:
+    m = PREFERRED_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    return raw or None
+
+
+def parse_assignee(text: str) -> str | None:
+    """Return the raw Assignee value, or None when the field is absent."""
+    m = ASSIGNEE_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    return raw or None
+
+
+def assignee_first_token(raw: str) -> str:
+    """The assignee identity without any trailing note.
+
+    Tolerates ``alice — owns the migration`` / ``ops@corp (badge access)`` so a
+    human can annotate *why* without defeating the parse.
+    """
+    return re.split(r"\s+[—–-]\s+|\s*[(,]", raw, maxsplit=1)[0].strip().strip("`")
+
+
+def is_agent_assignable(text: str) -> bool:
+    """True when *any agent* may claim this plan.
+
+    That is the safe/default case: the Assignee field is absent, or its value is
+    an explicit AI token (``ai``/``agent``/``unassigned``/…). A named person,
+    username, email, or ``human`` returns False — the plan belongs to them.
+    """
+    raw = parse_assignee(text)
+    if not raw:
+        return True
+    return assignee_first_token(raw).lower() in AGENT_ASSIGNEE_TOKENS
+
+
+def parse_title(text: str, fallback: str) -> str:
+    m = TITLE_RE.search(text)
+    return m.group(1).strip() if m else fallback
+
+
+def parse_depends_on(text: str) -> list[str]:
+    """Parse Depends on header and optional ## Depends on detail bullets → slugs."""
+    slugs: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str) -> None:
+        s = raw.strip().strip("`").strip()
+        if not s or s.lower() in {"none", "n/a", "-", "nil", "null"}:
+            return
+        # header may be "slug — note" or "slug (note)"
+        s = re.split(r"\s+[—–-]\s+|\s+\(", s, maxsplit=1)[0].strip().strip("`")
+        if not s or s.lower() in {"none", "n/a"}:
+            return
+        # drop path prefixes if someone wrote features/foo
+        if "/" in s:
+            s = s.rsplit("/", 1)[-1]
+        if s.endswith(".md"):
+            s = plan_slug(Path(s))
+        key = s.lower()
+        if key not in seen:
+            seen.add(key)
+            slugs.append(s)
+
+    m = DEPENDS_RE.search(text)
+    if m:
+        for part in m.group(1).split(","):
+            _add(part)
+
+    sec = DEPENDS_SECTION_RE.search(text)
+    if sec:
+        for bm in DEPENDS_BULLET_RE.finditer(sec.group(1)):
+            _add(bm.group(1))
+
+    return slugs
+
+
+def find_slug_paths(plans_root: Path, slug: str) -> list[tuple[str, Path]]:
+    """Return (lane, path) for every plan file whose slug matches."""
+    found: list[tuple[str, Path]] = []
+    if not plans_root.is_dir():
+        return found
+    needle = slug.lower()
+    for lane_dir in sorted(p for p in plans_root.iterdir() if p.is_dir()):
+        if lane_dir.name.startswith("."):
+            continue
+        for path in lane_dir.glob("*.md"):
+            if path.name == "README.md":
+                continue
+            if plan_slug(path).lower() == needle:
+                found.append((lane_dir.name, path))
+            # dated completion names: YYYY-MM-DD-slug.md
+            stem = path.name
+            if stem.endswith(".local.md"):
+                body = stem[: -len(".local.md")]
+            elif stem.endswith(".md"):
+                body = stem[:-3]
+            else:
+                body = path.stem
+            if re.match(r"^\d{4}-\d{2}-\d{2}-", body):
+                body_slug = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", body)
+                if body_slug.lower() == needle:
+                    found.append((lane_dir.name, path))
+    return found
+
+
+def _git_completed_evidence(project_root: Path, slug: str) -> tuple[bool, str]:
+    """True if git history shows the plan under .plans/completed/ (incl. deleted)."""
+    if not project_root.is_dir():
+        return False, "no project root for git check"
+    patterns = [
+        f".plans/completed/{slug}.md",
+        f".plans/completed/{slug}.local.md",
+        f".plans/completed/*-{slug}.md",
+        f".plans/completed/*-{slug}.local.md",
+    ]
+    try:
+        # Any commit that touched a completed path for this slug
+        r = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(project_root),
+                "log",
+                "--all",
+                "--oneline",
+                "--",
+                *patterns,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"git check failed: {exc}"
+    if r.returncode != 0:
+        return False, "git log failed (not a repo?)"
+    out = (r.stdout or "").strip()
+    if out:
+        first = out.splitlines()[0][:80]
+        return True, f"git history under completed/ ({first})"
+    return False, "no git history under .plans/completed/ for slug"
+
+
+def dependency_status(
+    plans_root: Path,
+    dep_slug: str,
+    *,
+    git_check: bool = True,
+) -> tuple[bool, str]:
+    """Return (satisfied, note) for one dependency slug.
+
+    Satisfied when the dependency is complete: present under completed/ and not
+    still open elsewhere, OR git shows it lived under completed/ (e.g. later
+    deleted) and it is not open now. Unsatisfied if still in any open lane or
+    never evidenced complete.
+    """
+    paths = find_slug_paths(plans_root, dep_slug)
+    open_hits = [(lane, p) for lane, p in paths if lane in OPEN_LANES]
+    completed_hits = [(lane, p) for lane, p in paths if lane == "completed"]
+
+    if open_hits:
+        locs = ", ".join(f"{lane}/{p.name}" for lane, p in open_hits)
+        return False, f"still open: {locs}"
+
+    if completed_hits:
+        locs = ", ".join(p.name for _, p in completed_hits)
+        return True, f"in completed/: {locs}"
+
+    if git_check:
+        ok, note = _git_completed_evidence(plans_root.parent, dep_slug)
+        if ok:
+            return True, note
+
+    return False, "not found complete (no completed/ file; no git evidence)"
+
+
+def evaluate_dependencies(
+    plans_root: Path,
+    depends_on: list[str] | tuple[str, ...],
+    *,
+    git_check: bool = True,
+) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
+    """Return (all_met, unmet_slugs, notes)."""
+    if not depends_on:
+        return True, (), ()
+    unmet: list[str] = []
+    notes: list[str] = []
+    for slug in depends_on:
+        ok, note = dependency_status(plans_root, slug, git_check=git_check)
+        notes.append(f"{slug}: {note}")
+        if not ok:
+            unmet.append(slug)
+    return (not unmet), tuple(unmet), tuple(notes)
+
+
+def inventory_all_plan_summaries(plans_root: Path) -> list[dict[str, str]]:
+    """Lightweight inventory for coordinators: slug, lane, title, goal snippet.
+
+    Used when evaluating whether a plan under discussion should Depend on others.
+    """
+    if not plans_root.is_dir():
+        return []
+    out: list[dict[str, str]] = []
+    for lane_dir in sorted(p for p in plans_root.iterdir() if p.is_dir()):
+        if lane_dir.name.startswith("."):
+            continue
+        for path in sorted(lane_dir.glob("*.md")):
+            if path.name == "README.md":
+                continue
+            raw_text, parse_error = safe_read_text(path)
+            if parse_error is not None:
+                continue
+            text = strip_code_fences(raw_text)
+            gm = GOAL_RE.search(text)
+            goal = " ".join((gm.group(1) if gm else "").split())[:240]
+            out.append(
+                {
+                    "slug": plan_slug(path),
+                    "lane": lane_dir.name,
+                    "rel": f"{lane_dir.name}/{path.name}",
+                    "title": parse_title(text, path.name),
+                    "goal": goal,
+                    "depends_on": ", ".join(parse_depends_on(text)) or "none",
+                }
+            )
+    return out
+
+
+# Closed specialty profile tags (mythos-core dual-axis fit). Appear in Preferred
+# models freeform lists; mechanical tier fit ignores them (unknown tokens already
+# drop out of tier/name buckets). Used for optional specialty_hint reporting.
+SPECIALTY_PROFILES = frozenset({
+    "coding-agent",
+    "terminal-agent",
+    "critic",
+    "planner",
+    "general-chat",
+    "multimodal",
+    "swarm-local",
+})
+
+
+def parse_specialty_profiles(preferred: str | None) -> list[str]:
+    """Return known specialty profile tags listed in a Preferred models field."""
+    if not preferred:
+        return []
+    out: list[str] = []
+    for part in preferred.split(","):
+        tok = part.strip().strip("`").lower()
+        if tok in SPECIALTY_PROFILES and tok not in out:
+            out.append(tok)
+    return out
+
+
+def _parse_preferred_tokens(preferred: str | None) -> tuple[list[str], list[str]]:
+    if not preferred:
+        return [], []
+    tiers: list[str] = []
+    names: list[str] = []
+    for part in preferred.split(","):
+        tok = part.strip().strip("`")
+        if not tok:
+            continue
+        low = tok.lower()
+        if low in SPECIALTY_PROFILES:
+            continue  # specialty tags are not tier/name power-fit tokens
+        if low in FIT_RANK:
+            tiers.append(low)
+        else:
+            names.append(low)  # lowercased; matches historical Preferred name fit
+    return tiers, names
+
+
+def classify_fit(worker: Worker, preferred: str | None) -> Fit:
+    """Classify worker vs plan Preferred models (same rules as /work)."""
+    tiers, names = _parse_preferred_tokens(preferred)
+    if not tiers and not names:
+        return Fit.UNKNOWN
+
+    wname = worker.name.lower().replace("_", " ").replace("-", " ")
+    for n in names:
+        n_norm = n.replace("_", " ").replace("-", " ")
+        if n_norm in wname or wname in n_norm:
+            return Fit.GOOD
+        n_parts = set(n_norm.split())
+        w_parts = set(wname.split())
+        if n_parts and n_parts <= w_parts:
+            return Fit.GOOD
+        if any(len(p) >= 4 and p in wname for p in n_parts):
+            return Fit.GOOD
+
+    if tiers and worker.tier in tiers:
+        return Fit.GOOD
+
+    if tiers:
+        wr = FIT_RANK.get(worker.tier, FIT_RANK["mid"])
+        max_pref = max(FIT_RANK[t] for t in tiers)
+        min_pref = min(FIT_RANK[t] for t in tiers)
+        if wr > max_pref:
+            return Fit.OVERQUALIFIED
+        if wr < min_pref:
+            return Fit.UNDERQUALIFIED
+        if wr not in {FIT_RANK[t] for t in tiers}:
+            return Fit.UNKNOWN
+        return Fit.GOOD
+
+    return Fit.UNKNOWN
+
+
+class Effort(str, Enum):
+    """Cost posture of the current session vs. what the plan's tier deserves."""
+
+    OK = "ok"
+    WASTEFUL = "wasteful"  # paying for reasoning this plan does not need
+    UNDERPOWERED = "underpowered"  # dial is below the band; raise it
+    UNKNOWN = "unknown"  # no effort given, or a name we do not rank
+
+
+@dataclass(frozen=True)
+class EffortAdvice:
+    """What to do with the reasoning dial for one plan.
+
+    ``verdict`` never gates eligibility by itself. For **non-Grok** products,
+    effort is a cost dial only. For the **Grok family**, reported effort also
+    sets effective Preferred tier via ``effective_fit_tier`` (separate from
+    this advice); this struct still recommends raising/lowering the dial to
+    match the plan's Preferred band.
+    """
+
+    verdict: Effort
+    suggested: str  # recommended setting for the plan's tier
+    band: tuple[str, ...]  # every acceptable setting for that tier
+    current: str | None = None
+
+    @property
+    def should_change(self) -> bool:
+        return self.verdict in (Effort.WASTEFUL, Effort.UNDERPOWERED)
+
+    def note(self) -> str:
+        """One short clause for a terse listing, or '' when nothing to say."""
+        if self.verdict is Effort.WASTEFUL:
+            return f"effort {self.current}→{self.suggested} (overpaying)"
+        if self.verdict is Effort.UNDERPOWERED:
+            return f"effort {self.current}→{self.suggested} (underpowered)"
+        return ""
+
+
+def normalize_effort(effort: str | None) -> str | None:
+    """Map a product's effort word onto our scale; None when unrecognized.
+
+    Accepts the common synonyms products actually ship (``off``/``minimal``,
+    ``max``/``xhigh``) so callers can pass a harness setting straight through.
+    """
+    if effort is None:
+        return None
+    e = effort.strip().lower().replace("_", "").replace("-", "")
+    aliases = {
+        "off": "none",
+        "disabled": "none",
+        "min": "minimal",
+        "med": "medium",
+        "veryhigh": "xhigh",
+        "max": "xhigh",
+        "ultra": "xhigh",
+    }
+    e = aliases.get(e, e)
+    return e if e in EFFORT_RANK else None
+
+def _model_tokens(name: str) -> list[str]:
+    """Split a product / endpoint id on common separators (incl. OpenRouter ``/``)."""
+    n = name.lower().replace("_", " ").replace("-", " ").replace("/", " ").replace(".", " ")
+    return n.split()
+
+
+def is_grok_family(name: str | None) -> bool:
+    """True when the worker product is Grok (4.5, 4.6, or generic "grok").
+
+    Accepts ``Grok``, ``Grok 4.6``, ``grok-4.5``, and slash-prefixed fleet ids
+    such as ``x-ai/grok-4.6`` / ``xai/grok-4.5``.
+
+    Lease / worktree ids that merely *contain* the token (``grok-effort-tier-46``)
+    are **not** Grok products — otherwise ``work_once --agent-id grok-* --effort
+    high`` would silently promote a non-Grok worker.
+    """
+    if not name:
+        return False
+    tokens = _model_tokens(name)
+    try:
+        i = tokens.index("grok")
+    except ValueError:
+        return False
+    rest = tokens[i + 1 :]
+    if not rest:
+        return True  # bare "grok"
+    # Product-shaped: grok + version 4 / 4.5 / 4.6 (optional trailing junk)
+    return rest[0] == "4" and (len(rest) == 1 or rest[1] in ("5", "6"))
+
+
+def is_grok_45(name: str | None) -> bool:
+    """True for Grok 4.5 (API coerces ``xhigh`` → ``high``)."""
+    if not name or not is_grok_family(name):
+        return False
+    tokens = _model_tokens(name)
+    return any(
+        tokens[i] == "4" and tokens[i + 1] == "5" for i in range(len(tokens) - 1)
+    )
+
+
+# Grok-family effort → effective Preferred fit tier (Grok 4.6-era map).
+# Unknown / unreported effort does **not** inherit API default high → frontier.
+GROK_EFFORT_TIER: dict[str, str] = {
+    "none": "mid",
+    "minimal": "mid",
+    "low": "mid",
+    "medium": "reasoner",
+    "high": "reasoner",  # API default on 4.6/4.5 — reasoner-class, not frontier
+    "xhigh": "frontier",  # 4.6-only explicit max; opt-in cost/depth
+}
+
+
+def grok_effort_to_tier(effort: str | None) -> str:
+    """Map a normalized effort word to mid|reasoner|frontier; unknown → mid."""
+    e = normalize_effort(effort)
+    if e is None:
+        return "mid"
+    return GROK_EFFORT_TIER.get(e, "mid")
+
+
+def effective_fit_tier(
+    name: str,
+    base_tier: str,
+    effort: str | None = None,
+) -> str:
+    """Session tier used for Preferred matching.
+
+    **Grok family:** when *effort* is a recognized dial setting, the
+    operator-confirmed map promotes/demotes eligibility (low→mid,
+    medium/high→reasoner, xhigh→frontier). Unrecognized or omitted effort
+    keeps **mid** (never silent frontier from API default).
+
+    **Other products:** catalog *base_tier* only; effort is cost advice
+    elsewhere (``classify_effort``), not a tier promotion.
+    """
+    base = normalize_fit_tier(base_tier)
+    if not is_grok_family(name):
+        return base
+    if effort is None or (isinstance(effort, str) and not effort.strip()):
+        return "mid"  # unknown dial → conservative mid
+    e = normalize_effort(effort)
+    if e is None:
+        return "mid"
+    # xAI treats 4.5 xhigh as high → landed map reasoner, not frontier.
+    if e == "xhigh" and is_grok_45(name):
+        e = "high"
+    return GROK_EFFORT_TIER.get(e, "mid")
+
+
+def worker_with_effort(
+    name: str,
+    base_tier: str,
+    effort: str | None = None,
+) -> Worker:
+    """Build a Worker whose ``tier`` is already the effective fit tier."""
+    return Worker(name=name, tier=effective_fit_tier(name, base_tier, effort))
+
+
+
+def plan_effort_tier(preferred: str | None) -> str:
+    """The tier that sets a plan's effort band: the **highest** tier it lists.
+
+    No listed tier (names-only, or no field at all) → ``mid``, matching the
+    ``/work`` rule that an absent Preferred line is a ceiling hint of ``mid``.
+    Note this is only about *cost*: it never gates who may claim the plan.
+    """
+    tiers, _ = _parse_preferred_tokens(preferred)
+    if not tiers:
+        return "mid"
+    return max(tiers, key=lambda t: FIT_RANK[t])
+
+
+def classify_effort(current: str | None, preferred: str | None) -> EffortAdvice:
+    """Advise on the reasoning dial for a plan. Never gates eligibility."""
+    band = TIER_EFFORT[plan_effort_tier(preferred)]
+    suggested = band[0]
+    now = normalize_effort(current)
+    if now is None:
+        return EffortAdvice(Effort.UNKNOWN, suggested, band, current)
+    if now in band:
+        return EffortAdvice(Effort.OK, suggested, band, now)
+    ranks = [EFFORT_RANK[b] for b in band]
+    if EFFORT_RANK[now] > max(ranks):
+        return EffortAdvice(Effort.WASTEFUL, suggested, band, now)
+    return EffortAdvice(Effort.UNDERPOWERED, suggested, band, now)
+
+
+def _record_from_path(
+    path: Path,
+    lane: str,
+    worker: Worker,
+    *,
+    owner: str | None = None,
+    plans_root: Path | None = None,
+    git_check: bool = True,
+) -> PlanRecord:
+    raw_text, parse_error = safe_read_text(path)
+    if parse_error is not None:
+        # Corrupt/unreadable file: never crash the daemon loop over one bad plan.
+        # Every field below falls back to a safe default; triage_plan's
+        # parse_error check rejects this record before any other field matters.
+        return PlanRecord(
+            path=path.resolve(),
+            rel=f"{lane}/{path.name}",
+            lane=lane,
+            slug=plan_slug(path),
+            value="medium",
+            priority=DEFAULT_PRIORITY,
+            preferred=None,
+            title=path.name,
+            fit=Fit.UNKNOWN,
+            owner=owner,
+            parse_error=parse_error,
+            has_goal=False,
+        )
+    # Fence-stripped once, reused by every field parser below — a plan that
+    # quotes an example header inside a code fence (anchor/templates/plan.md
+    # does exactly that) must never have the example read as its own field.
+    text = strip_code_fences(raw_text)
+    preferred = parse_preferred(text)
+    deps = tuple(parse_depends_on(text))
+    root = plans_root if plans_root is not None else path.parent.parent
+    met, unmet, notes = evaluate_dependencies(root, deps, git_check=git_check)
+    return PlanRecord(
+        path=path.resolve(),
+        rel=f"{lane}/{path.name}",
+        lane=lane,
+        slug=plan_slug(path),
+        value=parse_value(text),
+        priority=parse_priority(text),
+        preferred=preferred,
+        title=parse_title(text, path.name),
+        fit=classify_fit(worker, preferred),
+        owner=owner,
+        depends_on=deps,
+        deps_met=met,
+        deps_unmet=unmet,
+        deps_notes=notes,
+        assignee=parse_assignee(text),
+        agent_assignable=is_agent_assignable(text),
+        has_goal=has_goal_section(text),
+        release=parse_release_field(text),
+    )
+
+
+# Bias applied to a plan with no Release: header, or one whose release has no
+# real completion data (unknown-release / zero members) — see plan_sort_key.
+NEUTRAL_RELEASE_BIAS = 0.5
+
+
+def plan_sort_key(r: PlanRecord, release_bias: dict[str, float] | None = None) -> tuple:
+    """Ready-lane ordering key: lane → priority → value → release affinity →
+    oldest → filename.
+
+    Bugs (lane 0) always precede features (lane 1) — priority never lets a
+    feature jump a ready bug. Within a lane: ``P1`` before ``P2`` before ``P3``
+    (default ``P2``), then ``high`` before ``medium`` before ``low`` (default
+    ``medium``). ``release_bias`` (release slug → completion fraction, from
+    ``release_progress.py``) is optional and, when given, breaks ties **only**
+    within the same lane+priority+value: a plan whose release is closer to
+    100% complete sorts earlier than one in a barely-started release or no
+    release at all (``NEUTRAL_RELEASE_BIAS``). It can never move a plan across
+    a priority or value boundary — that is the hard bound this tiebreak must
+    never cross. Final tiebreaks: oldest file mtime, then filename.
+
+    Omitting ``release_bias`` (the default) reproduces the exact ordering from
+    before this term existed — every record gets the same neutral value, so
+    relative order is unchanged.
+    """
+    lane_i = 0 if r.lane == "bugs" else 1
+    pri_i = PRIORITY_RANK.get(r.priority, PRIORITY_RANK[DEFAULT_PRIORITY])
+    val_i = VALUE_RANK.get(r.value, VALUE_RANK["medium"])
+    bias = NEUTRAL_RELEASE_BIAS
+    if release_bias and r.release and r.release in release_bias:
+        bias = 1.0 - release_bias[r.release]
+    try:
+        mtime = r.path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (lane_i, pri_i, val_i, bias, mtime, r.path.name.lower())
+
+
+def _release_completion_map(plans_root: Path) -> dict[str, float]:
+    """release slug -> completion fraction, for plan_sort_key's soft tiebreak.
+
+    Local import: release_progress.py imports *from* this module (plan_slug,
+    plans_root_for, parse_release_field, …), so importing it back here at
+    module load time would cycle. Deferring the import here mirrors the
+    existing plan_lease pattern in inventory_in_progress. Omitted here, so
+    that plan_sort_key's default (NEUTRAL_RELEASE_BIAS) applies: any release
+    with zero members, **and any orphan slug with no `.releases/` file**. An
+    orphan is usually a typo in a plan's `Release:` header; without the
+    file_exists guard its members compute a real 0.0 fraction and sort behind
+    every equal-priority peer, which silently demotes a plan for a typo
+    instead of leaving it neutral.
+    """
+    # Cheap exit for the common case: a project with no .releases/ directory
+    # has no affinity to compute, and this runs on every plan_board redraw.
+    if not (plans_root / ".releases").is_dir():
+        return {}
+
+    from release_progress import scan_releases
+
+    releases = scan_releases(plans_root)
+    return {
+        slug: info.completed / info.total
+        for slug, info in releases.items()
+        if info.file_exists and info.total > 0
+    }
+
+
+def release_completion_map(plans_root: Path) -> dict[str, float]:
+    """Public accessor for the release-affinity map (see ``plan_sort_key``).
+
+    Any caller that sorts plan records with ``plan_sort_key`` and wants the
+    *same* head ordering ``/work`` produces must pass this — ``plan_board.py``
+    does, so its Ready column cannot disagree with the actual next pick.
+    """
+    return _release_completion_map(plans_root)
+
+
+def inventory_ready(plans_root: Path, worker: Worker | None = None) -> list[PlanRecord]:
+    """List ready-lane plans (bugs + features only), sorted by /work priority."""
+    if not plans_root.is_dir():
+        return []
+
+    w = worker or Worker(name="unknown", tier="mid")
+    records: list[PlanRecord] = []
+    for lane in READY_LANES:
+        lane_dir = plans_root / lane
+        if not lane_dir.is_dir():
+            continue
+        for path in sorted(lane_dir.glob("*.md")):
+            if path.name == "README.md":
+                continue
+            records.append(_record_from_path(path, lane, w, plans_root=plans_root))
+
+    release_bias = _release_completion_map(plans_root)
+    records.sort(key=lambda r: plan_sort_key(r, release_bias))
+    return records
+
+
+def inventory_in_progress(
+    plans_root: Path,
+    worker: Worker | None = None,
+    *,
+    agent_id: str | None = None,
+    only_mine: bool = False,
+) -> list[PlanRecord]:
+    """List plans under in-progress/.
+
+    When only_mine=True and agent_id is set, return only plans this agent owns
+    (active lease). Other agents' work is omitted — callers must ignore it.
+    """
+    # Local import avoids circular import at module load for pure select tests
+    from plan_lease import active_lease
+
+    ip = plans_root / IN_PROGRESS_LANE
+    if not ip.is_dir():
+        return []
+    w = worker or Worker(name="unknown", tier="mid")
+    records: list[PlanRecord] = []
+    for path in sorted(ip.glob("*.md")):
+        if path.name == "README.md":
+            continue
+        rel = f"{IN_PROGRESS_LANE}/{path.name}"
+        lease = active_lease(plans_root, rel)
+        owner = lease.agent_id if lease else None
+        if only_mine:
+            if not agent_id or owner != agent_id:
+                continue
+        records.append(
+            _record_from_path(
+                path, IN_PROGRESS_LANE, w, owner=owner, plans_root=plans_root
+            )
+        )
+    return records
+
+
+def inventory(
+    plans_root: Path,
+    worker: Worker | None = None,
+    *,
+    agent_id: str | None = None,
+    include_others_in_progress: bool = False,
+) -> list[PlanRecord]:
+    """Ready plans plus optional in-progress visibility.
+
+    Default: ready only. Pass agent_id to also list **your** in-progress plans
+    first (for resume). Other agents' in-progress files stay hidden unless
+    include_others_in_progress=True (list/debug only — never pick them).
+    """
+    mine: list[PlanRecord] = []
+    if agent_id:
+        mine = inventory_in_progress(
+            plans_root, worker, agent_id=agent_id, only_mine=True
+        )
+    others: list[PlanRecord] = []
+    if include_others_in_progress:
+        all_ip = inventory_in_progress(plans_root, worker, only_mine=False)
+        mine_rels = {r.rel for r in mine}
+        others = [r for r in all_ip if r.rel not in mine_rels]
+    ready = inventory_ready(plans_root, worker)
+    return mine + ready + others
+
+
+# Back-compat alias used by older tests
+def inventory_ready_alias(plans_root: Path, worker: Worker | None = None) -> list[PlanRecord]:
+    return inventory_ready(plans_root, worker)
+
+
+def assert_executable_path(
+    path: Path,
+    plans_root: Path | None = None,
+    *,
+    allow_in_progress: bool = True,
+) -> Path:
+    """Resolve path; raise ValueError if under drafts/ or completed/."""
+    resolved = path.expanduser().resolve()
+    parts = resolved.parts
+    if ".plans" in parts:
+        i = parts.index(".plans")
+        if i + 1 < len(parts) and parts[i + 1] in BLOCKED_LANES:
+            raise ValueError(
+                f"refuses .plans/{parts[i + 1]}/ (not an executable lane): {path}"
+            )
+        if (
+            i + 1 < len(parts)
+            and parts[i + 1] == IN_PROGRESS_LANE
+            and not allow_in_progress
+        ):
+            raise ValueError(
+                f"refuses .plans/{IN_PROGRESS_LANE}/ without ownership check: {path}"
+            )
+    if plans_root is not None:
+        try:
+            rel = resolved.relative_to(plans_root.resolve())
+        except ValueError:
+            pass
+        else:
+            if rel.parts and rel.parts[0] in BLOCKED_LANES:
+                raise ValueError(
+                    f"refuses .plans/{rel.parts[0]}/ (not an executable lane): {path}"
+                )
+    return resolved
+
+
+# Back-compat name
+def assert_ready_path(path: Path, plans_root: Path | None = None) -> Path:
+    return assert_executable_path(path, plans_root, allow_in_progress=True)
+
+
+def resolve_target(
+    plans_root: Path,
+    *,
+    slug: str | None = None,
+    path: str | Path | None = None,
+    agent_id: str | None = None,
+) -> PlanRecord | None:
+    """Resolve a named slug or path under ready lanes or own in-progress."""
+    from plan_lease import active_lease
+
+    w = Worker(name="unknown", tier="mid")
+
+    if path is not None:
+        p = Path(path)
+        if not p.is_absolute():
+            candidates = [
+                Path.cwd() / p,
+                plans_root.parent / p,
+                plans_root / p,
+            ]
+            for c in candidates:
+                if c.is_file():
+                    p = c
+                    break
+        resolved = assert_executable_path(p, plans_root)
+        if not resolved.is_file():
+            raise FileNotFoundError(f"plan not found: {path}")
+        try:
+            rel = resolved.relative_to(plans_root.resolve())
+            lane = rel.parts[0] if rel.parts else ""
+        except ValueError:
+            assert_executable_path(resolved)
+            text = resolved.read_text(encoding="utf-8")
+            return PlanRecord(
+                path=resolved,
+                rel=str(resolved),
+                lane="features",
+                slug=plan_slug(resolved),
+                value=parse_value(text),
+                priority=parse_priority(text),
+                preferred=parse_preferred(text),
+                title=parse_title(text, resolved.name),
+                assignee=parse_assignee(text),
+                agent_assignable=is_agent_assignable(text),
+            )
+        rel_s = str(rel).replace("\\", "/")
+        if lane == IN_PROGRESS_LANE:
+            lease = active_lease(plans_root, rel_s)
+            owner = lease.agent_id if lease else None
+            if owner and owner != agent_id:
+                raise ValueError(
+                    f"in-progress plan owned by {owner!r}; ignore unless you are that agent"
+                )
+            if not owner:
+                # No active lease (never claimed, or expired past TTL). Never
+                # silently reclaim — it may be another agent's live work. Recover
+                # explicitly (work_once --recover) or let a human return it.
+                raise ValueError(
+                    f"in-progress plan {rel_s} has no active lease for "
+                    f"{agent_id!r}; recover explicitly instead of resuming"
+                )
+            return _record_from_path(
+                resolved, lane, w, owner=owner, plans_root=plans_root
+            )
+        if lane not in READY_LANES:
+            raise ValueError(
+                f"plan not under ready lane bugs|features (or own in-progress/): {rel}"
+            )
+        return _record_from_path(resolved, lane, w, plans_root=plans_root)
+
+    if slug is not None:
+        matches: list[Path] = []
+        # Prefer own in-progress match for resume
+        if agent_id:
+            for name in (f"{slug}.md", f"{slug}.local.md"):
+                cand = plans_root / IN_PROGRESS_LANE / name
+                if cand.is_file():
+                    lease = active_lease(plans_root, f"{IN_PROGRESS_LANE}/{name}")
+                    if lease and lease.agent_id == agent_id:
+                        matches.append(cand)
+        for lane in READY_LANES:
+            for name in (f"{slug}.md", f"{slug}.local.md"):
+                cand = plans_root / lane / name
+                if cand.is_file():
+                    matches.append(cand)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            # Prefer in-progress own over ready if both somehow listed
+            ip = [m for m in matches if m.parent.name == IN_PROGRESS_LANE]
+            if len(ip) == 1 and agent_id:
+                return resolve_target(plans_root, path=ip[0], agent_id=agent_id)
+            raise ValueError(
+                "ambiguous slug "
+                f"{slug!r}: "
+                + ", ".join(str(m.relative_to(plans_root)) for m in matches)
+            )
+        return resolve_target(plans_root, path=matches[0], agent_id=agent_id)
+
+    return None
+
+
+def select_one(
+    plans_root: Path,
+    worker: Worker,
+    *,
+    no_fit_check: bool = False,
+    no_dep_check: bool = False,
+    slug: str | None = None,
+    path: str | Path | None = None,
+    skip_rels: set[str] | None = None,
+    agent_id: str | None = None,
+) -> PlanRecord | None:
+    """Pick one ready-lane plan by /work rules (bugs before features).
+
+    Bare pick considers **ready lanes only** — it never scans in-progress to
+    resume or reclaim. A named slug/path may still target your own in-progress
+    plan (ownership enforced in resolve_target). Skips plans with unmet Depends
+    on unless no_dep_check (named targets still return the record so callers can
+    surface unmet deps).
+    """
+    skip = skip_rels or set()
+
+    if slug or path:
+        rec = resolve_target(plans_root, slug=slug, path=path, agent_id=agent_id)
+        if rec is None:
+            return None
+        fit = classify_fit(worker, rec.preferred)
+        rec = replace(rec, fit=fit)
+        if rec.rel in skip:
+            return None
+        return rec
+
+    # Ready lanes only — bare pick never resumes/reclaims in-progress. Resuming
+    # your own work is an explicit named claim (resolve_target enforces the lease).
+    for rec in inventory_ready(plans_root, worker):
+        if rec.rel in skip:
+            continue
+        # Assigned to a named person → never a bare pick, regardless of fit.
+        # (A named target still returns the record so callers can refuse loudly.)
+        if not rec.agent_assignable:
+            continue
+        if not no_dep_check and not rec.deps_met:
+            continue
+        if no_fit_check:
+            return rec
+        if rec.fit in (Fit.GOOD, Fit.UNKNOWN):
+            return rec
+    return None
+
+
+def format_list_table(records: list[PlanRecord]) -> str:
+    if not records:
+        return "(no ready plans under bugs/ or features/; no owned in-progress)"
+    lines = ["path\tlane\tpriority\tvalue\tpreferred\tfit\tdeps\tassignee\towner"]
+    for r in records:
+        pref = r.preferred or "(default mid)"
+        owner = r.owner or "-"
+        assignee = "ai" if r.agent_assignable else assignee_first_token(r.assignee or "human")
+        if not r.depends_on:
+            deps = "none"
+        elif r.deps_met:
+            deps = "met:" + ",".join(r.depends_on)
+        else:
+            deps = "UNMET:" + ",".join(r.deps_unmet)
+        lines.append(
+            f"{r.rel}\t{r.lane}\t{r.priority}\t{r.value}\t{pref}"
+            f"\t{r.fit.value}\t{deps}\t{assignee}\t{owner}"
+        )
+    return "\n".join(lines)
+
+
+def _goal_snippet(path: Path, limit: int = 200) -> str:
+    text, parse_error = safe_read_text(path)
+    if parse_error is not None:
+        return ""
+    m = GOAL_RE.search(strip_code_fences(text))
+    return " ".join((m.group(1) if m else "").split())[:limit]
+
+
+def _next_main(argv: list[str] | None = None) -> int:
+    """Reliable single-plan picker for small/less-reliable models.
+
+    Prints exactly one next **ready** plan (or a clear nothing-ready message) so a
+    model never has to reason about lanes or leases. With --claim it performs the
+    atomic move-to-in-progress + lease write itself, so the model never runs
+    ``git mv`` or touches ``.leases/`` by hand.
+
+    Exit codes: 0 a plan was printed/claimed · 1 nothing ready · 2 error.
+    """
+    ap = argparse.ArgumentParser(
+        prog="plan_select.py",
+        description=_next_main.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--next", action="store_true", help="print the next ready plan")
+    ap.add_argument("--root", default=".", help="project root containing .plans/")
+    ap.add_argument(
+        "--claim",
+        action="store_true",
+        help="also move the plan to in-progress/ and write your lease (atomic)",
+    )
+    ap.add_argument("--json", action="store_true", help="emit a JSON object")
+    ap.add_argument("--tier", default="mid", help="worker catalog/base fit tier (default mid)")
+    ap.add_argument("--model", help="worker model name for Preferred-models match")
+    ap.add_argument(
+        "--effort",
+        help="reasoning effort (Grok family: sets effective fit tier; "
+             "low→mid, medium/high→reasoner, xhigh→frontier; omit→mid for Grok)",
+    )
+    ap.add_argument(
+        "--no-fit-check", action="store_true", help="ignore Preferred-models filter"
+    )
+    ap.add_argument(
+        "--no-dep-check", action="store_true", help="ignore unmet Depends on"
+    )
+    ap.add_argument("--agent-id", help="lease identity for --claim (default work-$USER)")
+    args = ap.parse_args(argv)
+
+    plans_root = plans_root_for(Path(args.root).resolve())
+    if not plans_root.is_dir():
+        msg = f"no .plans/ under {args.root}"
+        print(json.dumps({"ok": False, "error": msg}) if args.json else f"error: {msg}",
+              file=sys.stderr)
+        return 2
+
+    worker = worker_with_effort(
+        args.model or args.tier, args.tier, getattr(args, "effort", None)
+    )
+    rec = select_one(
+        plans_root,
+        worker,
+        no_fit_check=args.no_fit_check,
+        no_dep_check=args.no_dep_check,
+    )
+    if rec is None:
+        if args.json:
+            print(json.dumps({"ok": True, "plan": None, "note": "nothing ready"}))
+        else:
+            print("nothing ready (no fit plan under bugs/ or features/)")
+        return 1
+
+    goal = _goal_snippet(rec.path)
+    out: dict[str, object] = {
+        "ok": True,
+        "rel": rec.rel,
+        "lane": rec.lane,
+        "slug": rec.slug,
+        "priority": rec.priority,
+        "value": rec.value,
+        "fit": rec.fit.value,
+        "goal": goal,
+        "path": str(rec.path),
+    }
+
+    if args.claim:
+        from plan_lease import ClaimError, claim_and_move
+
+        agent_id = args.agent_id or f"work-{os.environ.get('USER') or 'agent'}"
+        try:
+            lease, dest = claim_and_move(plans_root, rec.rel, agent_id)
+        except ClaimError as exc:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+            else:
+                print(f"claim failed: {exc}", file=sys.stderr)
+            return 2
+        out.update({"claimed": True, "agent_id": agent_id,
+                    "rel": lease.plan_rel, "path": str(dest)})
+
+    if args.json:
+        print(json.dumps(out))
+    else:
+        claimed = " (claimed → in-progress/)" if args.claim else ""
+        print(f"next: {out['rel']}  [{rec.priority}/{rec.value}, fit={rec.fit.value}]{claimed}")
+        if goal:
+            print(f"goal: {goal}")
+        if not args.claim:
+            print(f"claim: python scripts/plan_select.py --next --claim --root {args.root}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_next_main())

@@ -1,0 +1,140 @@
+# Plan: <title>
+
+<!-- When writing into a repo that uses `./.plans`, use /draft (planning mode)
+     so agents save under drafts/ until a human moves the file into bugs/ or
+     features/. Agent finish: in-progress/ → review-needed/ when Done when holds;
+     human /review Approve → completed/. Private plans: /draft --local →
+     <slug>.local.md (gitignored). See `.plans/README.md`.
+
+     Path is authoritative — do NOT put Lane: or Status: in the file.
+     drafts/ = not ready · bugs|features/ = ready · review-needed/ = await human
+     · completed/ = done. -->
+
+- **Value:** high | medium | low          <!-- features only; omit for bugs -->
+- **Priority:** P1 | P2 | P3               <!-- P1 > P2 > P3; default P2 if omitted; orders within a lane -->
+- **Slug:** <filename without .md and without .local>
+- **Preferred models:** <names and/or tiers and optional specialty profile tags (`coding-agent`, `terminal-agent`, `critic`, `planner`, `general-chat`, `multimodal`, `swarm-local`) — who should execute this plan; e.g. `mid, coding-agent` or `coding-agent, Claude Sonnet 5`>
+- **Assignee:** ai                          <!-- optional; default ai. A person's name/username/email (or `human`) marks a plan agents must NOT auto-claim — a human completes it; agents may still edit its body for status/comments and commit that -->
+- **Depends on:** <comma-separated plan slugs, or `none`>  <!-- other .plans work that must be done first -->
+- **Release:** <release-slug>                <!-- optional; matches a .plans/.releases/<slug>.md file. Self-declaring — the release file never lists member plans, it's computed by scanning this field. Omit if this plan isn't part of a named release. -->
+
+## Likely touch points
+<!-- Optional, best-effort, advisory only — NOT authoritative and NOT
+     enforced. This is the planner's up-front guess at where an executor will
+     likely need to look, written once other sections below (Context read,
+     Steps) have surfaced real files/symbols — so draft this section last,
+     even though it's placed here for an executor to see immediately. It
+     never changes what's actually enforced: the per-step Steps `Touches`
+     column and a task spec's `## Files in scope` (scope-gate-checked) remain
+     the real boundaries. Verify against the actual code — this list can go
+     stale after edits, and that's an acceptable, known limitation, not a bug
+     to chase. Omit entirely (state "not applicable") rather than invent a
+     plausible-sounding file/function name for a genuinely exploratory plan.
+     One consolidated, deduped list for the whole plan — not repeated per
+     step. File-level alone is fine; name a function/class too when you
+     already know it. -->
+- `path/to/file.ext: function_or_class()` — why an executor would touch it
+- `path/to/other_file.ext` — file-level only, when no specific symbol is known yet
+
+## Progress
+<!-- Populate LAST, after ## Steps and ## Done when are written below — this
+     section mirrors them, so draft it after they exist even though it's
+     placed first for visibility. One `- [ ] Step N: <short label>` bullet
+     per Steps-table row (reuse that row's Task text, shortened), plus
+     exactly one trailing `- [ ] Done when holds` bullet. All start `[ ]` at
+     draft time. As execution proceeds, check off a Step bullet once that
+     step's Verify by passes, and check off `Done when holds` at finish. On
+     a mid-plan pause, leave unfinished bullets `[ ]` — "resume from the
+     first incomplete step" means the first `[ ]` bullet here. Optional
+     freeform notes (why paused, next action) may follow the checklist,
+     exactly like today's freeform `## Progress` note. Advisory only — never
+     parsed or enforced by tooling; omit entirely on plans predating this
+     convention, no retrofit required. -->
+- [ ] Step 1: <short label>
+- [ ] Done when holds
+
+## Goal
+<one sentence — the user-visible outcome>
+
+## Context read
+<files/docs actually read to form this plan>
+
+## Dependencies (how to fill)
+
+Before finalizing this plan, **inventory existing plans** under `.plans/` (all lanes:
+drafts, bugs, features, in-progress, ambiguous, blocked, completed). For each other
+plan, read at least its Goal (and Done when if present) and decide whether *this*
+work should wait on it:
+
+- Shared modules, APIs, or scaffolds that plan must land first → list its **Slug**
+- Same problem already tracked elsewhere → depend on it or merge; do not duplicate
+- Only soft thematic overlap → do **not** depend; mention under Context if useful
+
+Write slugs in **Depends on** (header). Executors **must not** start this plan while
+any dependency is unmet (still open outside `completed/`, and not evidenced complete
+in git history of `completed/`). Use `none` if you truly checked and found none.
+
+Optional detail list:
+
+```markdown
+## Depends on (detail)
+- `other-slug` — why this blocks us
+```
+
+## Constraints
+- <hard constraints: language, versions, style, perf, no-touch zones>
+
+## Conventions
+<language/framework from ANCHOR-CONVENTIONS.md (or detected/asked directly) + its idiomatic composition mechanism — see .anchor/ANCHOR.md "Code quality defaults". SOLID applies regardless.>
+
+## Steps
+| # | Task | Touches | Verify by | Route to |
+|---|------|---------|-----------|----------|
+| 1 | <atomic task> | <files> | <command/check> | <model tier> |
+
+## Risks
+- <risk → mitigation>
+
+## Escalation triggers
+- Ambiguous requirement discovered → back to planner
+- Task fails verification twice → bigger model
+- Architectural decision needed → bigger model / human
+- Step looks overqualified for its assigned tier (boilerplate/rename/formatting on a frontier route) → downgrade to smaller/local model instead
+
+## Done when
+<!-- Every criterion must be satisfiable on a **green** tree. Never write one
+     that only holds while a gate stays broken (e.g. "`ruff check .` reports
+     exactly one remaining finding"). A scope guardrail — "do not touch the
+     other finding" — belongs under `## Constraints`, where it restricts the
+     diff without becoming an acceptance condition. -->
+- <machine-checkable conditions, all must hold>
+
+---
+
+### Preferred models (for plan drafters)
+
+Fill **Preferred models** from plan complexity so cheap/capable executors find the right work and expensive tiers leave it alone. `/work` skips poor-fit plans unless the user names the plan or passes `--no-fit-check` (still one plan — not the whole backlog).
+
+Use **model names** and/or **tiers** (see `.anchor/ANCHOR.md` routing + `.anchor/model-fitness.md`):
+
+| Tier | Typical models | Good for |
+|------|----------------|----------|
+| `small` | Haiku, Qwen3 4–8B, Gemma 3 12B | Boilerplate, renames, formatting, thin docs |
+| `mid` | Sonnet-class, **Grok 4.5** (prefer cheaper), Grok 4.6 @ low/unknown, Qwen3 32B, GPT Terra | Scoped multi-file features, refactors, routine reviews |
+| `reasoner` | Opus-class, Nemotron thinking-on, R1 distill | Architecture, deep single-bug, security-adjacent |
+| `frontier` | Fable-class | Multi-hour autonomy, large migrations, multi-service debug |
+
+Examples:
+
+- `mid` — any solid executor; not worth frontier credits
+- `Claude Sonnet 5, Grok 4.5, Qwen3 32B` — named fleet picks
+- `reasoner, frontier` — needs a strong reasoner; small/mid should skip
+- `small, mid` — keep frontier/Opus off this work
+
+Omit only when unsure; default assumption for executors is **mid**. Per-step **Route to** still applies inside the plan for mixed-difficulty steps.
+
+### Assignee (human-owned plans)
+
+**Assignee** answers *who owns completion*, which is separate from *which model executes* (**Preferred models**). It defaults to **ai** — leave it off and any agent may claim the plan. Set it to a person's **name, username, or email** (or the literal `human`) for work that a person must finish: a release sign-off, a manual QA pass, anything gated on human judgment or access.
+
+An agent-assigned plan (absent, `ai`, `agent`, `unassigned`) is claimable as normal. A human-assigned plan is **auto-skipped** by `/work`, `plan_fit.py`, `work_once.py`, and the coordinator MCP — no agent claims it or moves it to in-progress/review-needed/completed. Agents may still **read it and edit its body** (add a `## Progress`/status note, answer a question) and commit that change; only *completing* it is reserved. `work_once.py --allow-assigned` forces a named claim when an operator really wants an agent to take it.

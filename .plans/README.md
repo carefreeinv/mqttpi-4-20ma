@@ -1,0 +1,273 @@
+# `.plans/` — tracked work plans
+
+**Start here:** run **`/work`** in your coding agent (optional: `/work --list`,
+`/work <slug>`, `/work --no-fit-check`). Do not re-derive priority from chat.
+
+Plans are **git-tracked markdown** under this **dotdir**. Do **not** gitignore
+the whole `.plans/` tree. Exception: `*.local.md` plans are ignored via
+`.plans/.gitignore` (private/dev work you don't want committed). Many UIs hide
+dotfolders — always use the explicit path `.plans/`.
+
+## Documentation vs plans (hard rule)
+
+**Docs describe the project’s current shipped state — not plans.** README, `docs/`,
+CHANGELOG, blog, and public prose must not restate the **contents** of this tree
+(drafts, ready backlog, in-progress bodies, unfinished acceptance items) as product
+docs or roadmap. When work from a plan ships, document the code and public contract
+— not the plan file. Documenting how **this workflow** works (lanes, `/work`, path
+rules) is fine; documenting “what we plan to build next” from plan files is not.
+
+## Path is authoritative
+
+**Lane and lifecycle status live only in the filesystem path.** Humans move
+files freely; do **not** put `Lane:` or `Status:` inside plan markdown.
+
+| Path | Meaning | Who may execute? |
+|------|---------|------------------|
+| `bugs/` | ready bug work (highest priority) | any fit agent (then move → `in-progress/`) |
+| `features/` | ready feature work | any fit agent (then move → `in-progress/`) |
+| `in-progress/` | claimed / being worked | **only the agent that moved it there** |
+| `ambiguous/` | half-baked / needs clarification | **no** (parked; not auto-picked) |
+| `blocked/` | cannot proceed with current means | **no** (parked; not auto-picked) |
+| `review-needed/` | agent asserts Done when; await human `/review` | **no** (`/review` Approve merges feature→dev then → `completed/`; empty queue may Promote dev→main) |
+| `drafts/` | not ready (edit / design) | no one (edit only) |
+| `completed/` | finished archive | no one |
+
+## Agent move rule (hard)
+
+Agents may relocate plan files **only** as follows:
+
+```text
+bugs|features/<slug>.md     ──mv──►  in-progress/     (starting work + lease)
+in-progress/<slug>.md       ──mv──►  review-needed/   (Done when holds — default)
+in-progress/<slug>.md       ──mv──►  completed/       (ONLY via /work culmination
+                                                      merge: operator answers in
+                                                      session + scoped gate passes)
+review-needed/<slug>.md     ──mv──►  completed/       (HUMAN ONLY via /review Approve)
+review-needed/<slug>.md     ──mv──►  bugs|features/   (Needs Work / release)
+bugs|features|in-progress/  ──mv──►  ambiguous/       (half-baked / underspecified)
+bugs|features|in-progress/  ──mv──►  blocked/         (cannot fix now)
+in-progress/<slug>.md       ──mv──►  bugs|features/   (release claim for others)
+ambiguous|blocked/<slug>.md ──mv──►  bugs|features/   (return when unblocked/clarified)
+```
+
+Claiming a ready plan is **required to record a lease** under `.plans/.leases/`
+(agent id + long-TTL expiry) as it moves the file into `in-progress/` — the two
+happen together so the plan is never left looking unowned. A live agent refreshes
+its lease (heartbeat); only a lease untouched past the long TTL is reclaimable,
+and only via an explicit recover. There is **no silent reclaim**. Headless:
+`work_once.py` claim/heartbeat/recover/park/return helpers, or
+`plan_select.py --next --claim`.
+
+Agents must **never**:
+
+- Promote `drafts/` → ready **except** via explicit **`/draft --promote <slug>`**
+  (agent infers `bugs/` vs `features/` from the plan; or clear user language
+  handled by the `/draft` skill). `/work` and fleet pullers must **never** promote.
+- **Drop or add** the `.local` suffix on any move (basename is sticky; only humans rename)
+- Move ready/in-progress → `drafts/`
+- Swap `bugs/` ↔ `features/` except via explicit return targeting a lane
+- Move anything out of `completed/`
+- **Move `in-progress/` → `completed/`** on your own judgment — that transition
+  exists only as the tail of an operator-authorized `/work` culmination merge
+- **Move `review-needed/` → `completed/`** except under human **`/review` Approve**
+- **Touch another agent’s `in-progress/` plan** (ignore it)
+
+If a draft is named for **execution** (`/work`): refuse; offer `/draft --load`
+or `/draft --promote …` then `/work` on the ready path.
+
+## How to start
+
+0. **`/draft`** — planning mode on **`.plans/drafts/`**: create, `--list`,
+   `--load` / open existing slug for discussion, optional `--local` →
+   `*.local.md`. **Promote** with `/draft --promote <slug>` (infer bugs vs
+   features from the plan). Does not implement product work.
+1. `/work` — next **ready** plan by priority + **model fit** (bugs/features
+   only; never scans `in-progress/`)
+2. `/work --list` — inventory ready plans (+ your in-progress); **ignore others’**
+3. `/work <slug>` or `/work .plans/features/foo.md` — named plan (a named
+   `in-progress/` path resumes only work **you** own)
+4. `/work --no-fit-check` — same priority pick, ignore model-fit filter (still
+   **one** plan, not the whole backlog)
+
+Headless pull (companion to `/work`, not a replacement):
+
+```bash
+python scripts/work_once.py --list --tier mid --agent-id worker-1
+python scripts/work_once.py --once --tier mid --agent-id worker-1   # → in-progress/
+python scripts/work_once.py --max-plans 3 --tier small --agent-id swarm-a
+python scripts/work_once.py --triage --tier mid --agent-id worker-1  # accept/skip/reject; no LLM, no claim
+```
+
+Uses the same priority + Preferred-models rules; moves claimed plans into
+`in-progress/` and writes leases under `.plans/.leases/` (gitignored). Prefer
+one writer per clone/worktree.
+
+**Multi-agent fleet:** unique `--agent-id` per worker; each ignores
+`in-progress/` plans it did not claim. Full guide:
+[Multi-agent fleet workers](https://carefreeinv.com/anchor/docs/tooling/fleet-workers)
+(source: `docs/docs/tooling/fleet-workers.md`). Durable timers: run **`/fleet-watch`** in your coding agent (from the project, or
+`/fleet-watch <name>` from Anchor)—see
+[docs](https://carefreeinv.com/anchor/docs/skills/fleet-watch).
+
+## Priority (bare `/work`)
+
+Ready lanes only — bare `/work` never scans `in-progress/`.
+
+1. All `bugs/*.md` before any feature
+2. Within each lane by header `Priority: P1 | P2 | P3` (default **P2**), then
+   `Value: high | medium | low` (default medium), then oldest first (mtime):
+   P1 → P2 → P3, then high → medium → low
+3. Keep only **model-fit** plans unless `--no-fit-check` or user names a plan
+4. Never `drafts/`, `completed/`, `ambiguous/`, `blocked/`, `review-needed/`,
+   **any** `in-progress/`, or this README
+
+## Write / promote / finish
+
+```text
+Write:    /draft → .plans/drafts/<slug>.local.md (private default; --shared → tracked .md)
+List:     /draft --list
+Load:     /draft --load <slug>  (or /draft <slug> if file exists)
+Promote:  /draft --promote <slug>  (infer bugs|features from plan; path = ready)
+Claim:    agent → move into in-progress/ + lease (path = working)
+Execute:  /work → follow Steps; verify each step
+Park:     agent → ambiguous/ (half-baked) or blocked/ (cannot fix)
+Release:  agent → bugs|features/ (give up claim; still ready for others)
+Finish:   agent: git mv in-progress/ → review-needed/; human /review Approve
+          merges feature → dev then → completed/; empty queue may Promote dev → main
+          — OR the operator answers /work's culmination question with "merge to dev
+          now": scoped gate runs, branch lands on dev, plan → completed/ with a
+          ## Handoff note recording the skipped review
+Worktree: parallel agents use scripts/worktree_for_agent.py ensure
+          --agent-id … [--slug …] (var/worktrees/<id>/); or work_once --ensure-worktree
+Branch:   from **dev** (else **develop**); if neither exists, **create dev**
+          from **main** (else **master**) and push origin when possible
+Commit:   **/commit-prep** first for anything outside `.plans/` (prep only: tests +
+          CHANGELOG + blog); a plans-only commit — a lane move, review notes — takes
+          the light path: state what moved and why, then `git commit -m "…" -- .plans/`. If green
+          and plan complete, commit on feature branch (see /work); optional push
+          of that branch only. **Agents never merge on their own initiative**;
+          `/work` may land on **dev only** via the operator's in-session answer +
+          scoped gate. Human **`/review` Approve** merges feature → dev; empty-queue
+          **Promote** merges dev → main (survey-gated; no force-push). **main is
+          never reached from `/work`.**
+```
+
+Mid-session stop: leave the file in **`in-progress/`** with a short `## Progress`
+note. Do **not** move to `completed/`. Other agents must ignore that file.
+
+Half-baked or stuck: move to **`ambiguous/`** or **`blocked/`** and note why in
+`## Progress` / session footer. Unparking back to ready is allowed when the
+blocker is cleared.
+
+## Plan header (recommended)
+
+```markdown
+# Plan: <title>
+
+- **Value:** high | medium | low    # features only; omit for bugs
+- **Priority:** P1 | P2 | P3         # P1 > P2 > P3; default P2; orders within a lane
+- **Slug:** <filename-without-md>
+- **Preferred models:** <names and/or tiers>
+- **Assignee:** ai                   # optional; default ai. A name/username/email (or `human`) = a person completes it, agents auto-skip claiming
+- **Depends on:** <slug-a, slug-b | none>
+- **Release:** <release-slug>        # optional; see ## Releases below
+
+## Goal
+...
+```
+
+**Do not** include `Lane:` or `Status:` — the directory is the marker.
+
+### Dependencies
+
+Plans may list other plan **slugs** they require first. When drafting or coordinating:
+
+1. Inventory existing `.plans/**` (all lanes).
+2. Compare goals — add **Depends on** when this work should wait on another plan.
+3. Use `none` only after checking.
+
+**Executors must not start** a plan while any dependency is unmet: still open outside
+`completed/`, and not evidenced complete in git history of `.plans/completed/`.
+Logical checks: open-lane presence wins over stale memory; completed file or git
+history of completed/ satisfies. Coordinators (project MCP / planners) should
+propose Depends on when discussing a plan.
+
+Body sections match `.anchor/templates/plan.md`. **Preferred models** uses tiers
+`small | mid | reasoner | frontier` and/or concrete names so `/work` can leave
+work for cheaper or stronger models.
+
+### Human-owned plans (optional)
+
+**Assignee** names who owns *completion* — separate from **Preferred models**
+(which model *executes*). It defaults to **ai**: omit it, or use `ai` / `agent` /
+`unassigned`, and any agent may claim the plan. Set it to a person's **name,
+username, or email** (or `human`) for work a person must finish — a release
+sign-off, manual QA, anything gated on human judgment or access. Agents then
+**auto-skip** claiming it (`/work`, `plan_fit.py`, `work_once.py`, coordinator
+MCP), whatever its fit; they may still read it and edit its body for
+status/comments and commit that. Only *completing* it is reserved to the human.
+
+## Releases
+
+A plan may optionally point at a named **release** via its own header:
+
+```markdown
+- **Release:** v0.3.0   # slug matches a .plans/.releases/<slug>.md file
+```
+
+The release file under **`.plans/.releases/<slug>.md`** holds only
+release-level metadata — status and an optional target version — **never**
+a list of member plans:
+
+```markdown
+# Release: v0.3.0 — <name>
+
+- **Status:** open   # open | ready | shipped
+- **Target:** v0.3.0 # optional; matches /tag scheme if used
+```
+
+Membership always flows **plan → release**, computed by scanning every
+plan's `Release:` field — never the other way around. This matters because
+a release's membership grows over time: a new plan joining an existing
+release only needs its own `Release:` line set, never a second file edited.
+Unlike `.leases/`, **`.releases/` is tracked** (not gitignored) — it's a
+durable planning decision, not ephemeral claim state.
+
+`/work` gives ready plans in the release closest to complete a **soft**
+tiebreak — inserted only between `Priority`/`Value` and the existing
+oldest-mtime tiebreak, so it can never promote a lower-priority or
+lower-value plan ahead of a higher one. When every plan pointing at an
+`open` release has reached `completed/`, `/work` or `/review` asks once
+whether to prepare it (hands off to `/release` — never runs it
+automatically), then marks the release `ready` so it doesn't ask again.
+
+## Cross-model handoff
+
+| Role | Writes / reads |
+|------|----------------|
+| Planner (NIM, local, human) | Write under `drafts/` only; **human** moves when ready |
+| Executor (`/work`, Fable, Sonnet, Grok, …) | Ready → own `in-progress/` → `review-needed/`; human `/review` Approve merges feature→dev then → `completed/`; ignore others’ in-progress |
+| Critic | Plan **Done when** + diff |
+
+Plans must be **self-contained** (Goal, Steps with verify commands, Done when).
+Executors open the file first; do not re-plan unless Done when is impossible.
+
+## Naming
+
+- Tracked: `kebab-case-slug.md` — **Slug** is the stem without `.md`
+- Untracked (local-only): `kebab-case-slug.local.md` — same **Slug** without
+  the `.local` suffix; gitignored by `.plans/.gitignore` (`**/*.local.md`)
+- **Fresh drafts default to `<slug>.local.md`** (private/uncommitted); `/draft --shared`
+  creates a tracked `<slug>.md` instead
+- **`.local` is sticky:** promote and agent lane moves keep the same basename
+  (`drafts/foo.local.md` → `features/foo.local.md` → …). Agents never drop
+  `.local`; only a **human manual rename** may make a local plan tracked
+- `/work <slug>` matches either `slug.md` or `slug.local.md` under ready lanes
+  (or your own `in-progress/`)
+- Optional on completion: `YYYY-MM-DD-<slug>.md` (or keep `…local.md`) under `completed/`
+
+## Checker
+
+Optional: `python3 scripts/check_plans.py` (path under a known lane, required
+sections for executable lanes; flags obsolete `Lane:` / `Status:` headers).
